@@ -4,6 +4,21 @@ Copyright 2013 by Chris Osborn <fozztexx@fozztexx.com>
 See COPYING file for detailed information on terms of copying.
 
 ----------------------------------------
+To compile this code you need to install the correct linux version on your rapsberry pi.
+The best option I found is the rpi-source.
+
+https://github.com/notro/rpi-source/wiki
+
+To compile:
+$ cd o9pin 
+$ make 
+$ cd iec 
+$ make 
+$ sudo make install 
+$ sudo depmod
+$ sudo modprobe iec
+$ cd ..
+$ sudo ./ninepin 
 
 http://insentricity.com/a.cl/207
 

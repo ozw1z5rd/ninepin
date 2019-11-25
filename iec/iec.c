@@ -661,7 +661,6 @@ int iec_writeByte(int bits)
 int iec_init(void)
 {
   int result;
-  struct resource *mem;
   int minor;
 
 
