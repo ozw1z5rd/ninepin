@@ -28,7 +28,6 @@
 #include <linux/errno.h>
 #include <linux/proc_fs.h>
 #include <linux/fcntl.h>
-#include <asm/system.h>
 #include <asm/uaccess.h>
 #include <linux/interrupt.h>
 #include <linux/gpio.h>
@@ -668,8 +667,12 @@ int iec_init(void)
 
   /* http://www.makelinux.com/ldd3/ */
   /* http://stackoverflow.com/questions/5970595/create-a-device-node-in-code */
-  
-  mem = request_mem_region(GPIO_BASE, 4096, LABEL_DEVICE);
+ 
+  if ( request_mem_region(GPIO_BASE, 4096, LABEL_DEVICE) == NULL ) { 
+      printk(KERN_ALERT "Unable to reserve I/O memory address");
+      return -EBUSY;
+  }      
+
   gpio = ioremap(GPIO_BASE, 4096);
 
   pinMode(IEC_ATN, INPUT);
