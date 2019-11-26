@@ -18,7 +18,6 @@
  */
 
 #include "cbmdos.h"
-#include "joystick.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/select.h>
@@ -28,7 +27,7 @@
 
 int main(int argc, char *argv[])
 {
-  int dosfd, joyfd;
+  int dosfd;
   fd_set rd, ex;
   int count;
   struct timeval timeout;
@@ -39,40 +38,22 @@ int main(int argc, char *argv[])
   for (count = 1; count < argc && count < 5; count++)
     dosMountDisk(argv[count], count - 1);
 
-  if (!geteuid())
-    joyfd = initJoystick();
-  else {
-    fprintf(stderr, "Must be root to do GPIO for joystick\n");
-    joyfd = -1;
-  }
-  
   dosfd = open("/dev/iec8", O_RDWR);
   if (dosfd < 0)
     fprintf(stderr, "Unable to open IEC device\n");
 
-  for (; dosfd >= 0 || joyfd >= 0;) {
+  for (; dosfd >= 0 ;) {
     FD_ZERO(&rd);
-    if (joyfd >= 0)
-      FD_SET(joyfd, &rd);
     if (dosfd >= 0)
       FD_SET(dosfd, &rd);
     ex = rd;
     timeout.tv_sec = 0;
-    timeout.tv_usec = ANALOG_INTERVAL;
+    timeout.tv_usec =  5000;
     select(NOFILE, &rd, NULL, &ex, &timeout);
 
-    if (FD_ISSET(joyfd, &rd))
-      joystickHandleIO(joyfd);
     if (FD_ISSET(dosfd, &rd))
       dosHandleIO(dosfd);
 
-    updatePaddles();
-    
-    if (FD_ISSET(joyfd, &ex)) {
-      fprintf(stderr, "Error with joystick\n");
-      close(joyfd);
-      joyfd = -1;
-    }
     if (FD_ISSET(dosfd, &ex)) {
       fprintf(stderr, "Error with IEC\n");
       close(dosfd);

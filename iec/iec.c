@@ -141,9 +141,9 @@ static inline int iec_waitForSignals(int pin, int val, int pin2, int val2, int d
 
   do_gettimeofday(&start);
   for (;;) {
-    if (digitalRead(pin) == val)
+    if (gpio_get_value(pin) == val)
       break;
-    if (pin2 && digitalRead(pin2) == val2)
+    if (pin2 && gpio_get_value(pin2) == val2)
       break;
 
     do_gettimeofday(&now);
@@ -159,13 +159,8 @@ static inline int iec_waitForSignals(int pin, int val, int pin2, int val2, int d
 
 void iec_releaseBus(void)
 {
-#if NUMPINS == 3
-  pinMode(IEC_CLK, INPUT);
-  pinMode(IEC_DATA, INPUT);
-#else
-  digitalWrite(IEC_CLKOUT, HIGH);
-  digitalWrite(IEC_DATAOUT, HIGH);
-#endif
+  gpio_direction_input(IEC_CLK);
+  gpio_direction_input(IEC_DATA);
   udelay(c64slowdown);
   return;
 }
@@ -175,18 +170,13 @@ static irqreturn_t iec_handleATN(int irq, void *dev_id, struct pt_regs *regs)
   int atn;
 
   
-  atn = !digitalRead(IEC_ATN);
+  atn = !gpio_get_value(IEC_ATN);
   printk(KERN_NOTICE "IEC: attention %i\n", atn);
   if (atn) {
     iec_atnState = IECAttentionState;
     iec_state = IECWaitState;
-#if NUMPINS == 3
-    pinMode(IEC_CLK, INPUT);
-    pinMode(IEC_DATA, OUTPUT);
-#else
-    digitalWrite(IEC_CLKOUT, HIGH);
-    digitalWrite(IEC_DATAOUT, LOW);
-#endif
+    gpio_direction_input(IEC_CLK);
+    gpio_direction_output(IEC_DATA,1);
   }
   else
     iec_atnState = IECWaitState;
@@ -316,27 +306,17 @@ static inline int iec_readByte(void)
 
 
   local_irq_save(flags);
-#if NUMPINS == 3
-  pinMode(IEC_DATA, INPUT);
-#else
-  digitalWrite(IEC_DATAOUT, HIGH);
-#endif
+  gpio_direction_input(IEC_DATA);
 
   do_gettimeofday(&start);
-  for (abort = eoi = 0; !abort && digitalRead(IEC_CLK); ) {
+  for (abort = eoi = 0; !abort && gpio_get_value(IEC_CLK); ) {
     do_gettimeofday(&now);
     elapsed = (now.tv_sec - start.tv_sec) * 1000000 + (now.tv_usec - start.tv_usec);
 
     if (!eoi && elapsed >= 200) {
-#if NUMPINS == 3
-      pinMode(IEC_DATA, OUTPUT);
+      gpio_direction_output(IEC_DATA,0);
       udelay(c64slowdown*2);
-      pinMode(IEC_DATA, INPUT);
-#else
-      digitalWrite(IEC_DATAOUT, LOW);
-      udelay(c64slowdown*2);
-      digitalWrite(IEC_DATAOUT, HIGH);
-#endif
+      gpio_direction_input(IEC_DATA);
       eoi = DATA_EOI;
     }
 
@@ -361,7 +341,7 @@ static inline int iec_readByte(void)
       break;
     }
 
-    if (digitalRead(IEC_DATA))
+    if (gpio_get_value(IEC_DATA))
       bits |= 1 << len;
 
     if (iec_waitForSignals(IEC_CLK, 0, 0, 0, 150)) {
@@ -371,11 +351,7 @@ static inline int iec_readByte(void)
     }
   }
 
-#if NUMPINS == 3
-  pinMode(IEC_DATA, OUTPUT);
-#else
-  digitalWrite(IEC_DATAOUT, LOW);
-#endif
+  gpio_direction_output(IEC_DATA, 1);
   local_irq_restore(flags);
   
   udelay(c64slowdown);
@@ -393,7 +369,7 @@ static irqreturn_t iec_handleCLK(int irq, void *dev_id, struct pt_regs *regs)
   int abort;
 
 
-  atn = !digitalRead(IEC_ATN);
+  atn = !gpio_get_value(IEC_ATN);
   if (!atn)
     iec_atnState = IECWaitState;
   
@@ -462,13 +438,8 @@ int iec_setupTalker(void)
     printk(KERN_NOTICE "IEC: Timeout waiting for start of talk\n");
 
   if (!abort) {
-#if NUMPINS == 3
-    pinMode(IEC_DATA, INPUT);
-    pinMode(IEC_CLK, OUTPUT);
-#else
-    digitalWrite(IEC_DATAOUT, HIGH);
-    digitalWrite(IEC_CLKOUT, LOW);
-#endif
+    gpio_direction_input(IEC_DATA);
+    gpio_direction_output(IEC_CLK,0);
     udelay(c64slowdown);
     iec_state = IECOutputState;
   }
@@ -561,25 +532,21 @@ int iec_writeByte(int bits)
   unsigned long flags;
 
 
-  if (!digitalRead(IEC_ATN) || iec_state != IECOutputState) {
+  if (!gpio_get_value(IEC_ATN) || iec_state != IECOutputState) {
     printk(KERN_NOTICE "IEC: attention before write\n");
     return 1;
   }
   
   disable_irq(irq_clk);
   local_irq_save(flags);
-  //printk(KERN_NOTICE "IEC: Write: %03x data: %i\n", bits, digitalRead(IEC_DATA));
-#if NUMPINS == 3
-  pinMode(IEC_CLK, INPUT);
-#else
-  digitalWrite(IEC_CLKOUT, HIGH);
-#endif
+  //printk(KERN_NOTICE "IEC: Write: %03x data: %i\n", bits, gpio_get_value(IEC_DATA));
+  gpio_direction_input(IEC_CLK);
 
   if ((abort = iec_waitForSignals(IEC_DATA, 1, IEC_ATN, 0, 100000)))
     printk(KERN_NOTICE "IEC: Timeout waiting to send\n");
 
   /* Because interrupts are disabled it's possible to miss the ATN pause signal */
-  if (!digitalRead(IEC_ATN)) {
+  if (!gpio_get_value(IEC_ATN)) {
     printk(KERN_NOTICE "IEC: attention before send\n");
     iec_state = IECWaitState;
     iec_atnState = IECAttentionState;
@@ -594,47 +561,31 @@ int iec_writeByte(int bits)
       printk(KERN_NOTICE "IEC: Timeout waiting for EOI ack finish\n");
   }
 
-#if NUMPINS == 3
-  pinMode(IEC_CLK, OUTPUT);
-#else
-  digitalWrite(IEC_CLKOUT, LOW);
-#endif
+  gpio_direction_output(IEC_CLK,0);
   local_irq_restore(flags);
   udelay(c64slowdown);
   
   for (len = 0; !abort && len < 8; len++, bits >>= 1) {
-    if (!digitalRead(IEC_ATN) || iec_state != IECOutputState) {
+    if (!gpio_get_value(IEC_ATN) || iec_state != IECOutputState) {
       printk(KERN_NOTICE "IEC: attention during write\n");
       abort = 1;
       break;
     }
-#if NUMPINS == 3
     if (bits & 1)
-      pinMode(IEC_DATA, INPUT);
+      gpio_direction_input(IEC_DATA);
     else
-      pinMode(IEC_DATA, OUTPUT);
-#else
-    digitalWrite(IEC_DATAOUT, bits & 1);
-#endif
+      gpio_direction_output(IEC_DATA, 1);
+
     udelay(c64slowdown*2);
-#if NUMPINS == 3
-    pinMode(IEC_CLK, INPUT);
-#else
-    digitalWrite(IEC_CLKOUT, HIGH);
-#endif
+    gpio_direction_input(IEC_CLK);
     udelay(c64slowdown*2);
-#if NUMPINS == 3
-    pinMode(IEC_DATA, INPUT);
-    pinMode(IEC_CLK, OUTPUT);
-#else
-    digitalWrite(IEC_DATAOUT, HIGH);
-    digitalWrite(IEC_CLKOUT, LOW);
-#endif
+    gpio_direction_input(IEC_DATA);
+    gpio_direction_output(IEC_CLK, 1);
   }
   enable_irq(irq_clk);
 
   if (!abort && (abort = iec_waitForSignals(IEC_DATA, 0, IEC_ATN, 0, 10000))) {
-    if (digitalRead(IEC_ATN)) {
+    if (gpio_get_value(IEC_ATN)) {
       printk(KERN_NOTICE "IEC: Timeout waiting for listener ack\n");
       abort = 0;
     }
@@ -647,12 +598,8 @@ int iec_writeByte(int bits)
 
   udelay(c64slowdown);
 
-  if (abort && !digitalRead(IEC_ATN)) {
-#if NUMPINS == 3
-    pinMode(IEC_CLK, INPUT);
-#else
-    digitalWrite(IEC_CLKOUT, HIGH);
-#endif
+  if (abort && !gpio_get_value(IEC_ATN)) {
+    gpio_direction_input(IEC_CLK);
   }
   
   return abort;
@@ -663,31 +610,15 @@ int iec_init(void)
   int result;
   int minor;
 
-
   /* http://www.makelinux.com/ldd3/ */
   /* http://stackoverflow.com/questions/5970595/create-a-device-node-in-code */
  
-  if ( request_mem_region(GPIO_BASE, 4096, LABEL_DEVICE) == NULL ) { 
-      printk(KERN_ALERT "Unable to reserve I/O memory address");
-      return -EBUSY;
-  }      
+  gpio_direction_input(IEC_ATN);
+  gpio_direction_input(IEC_CLK);
+  gpio_direction_input(IEC_DATA);
 
-  gpio = ioremap(GPIO_BASE, 4096);
-
-  pinMode(IEC_ATN, INPUT);
-  pinMode(IEC_CLK, INPUT);
-  pinMode(IEC_DATA, INPUT);
-
-#if NUMPINS == 3
-  digitalWrite(IEC_CLK, LOW);
-  digitalWrite(IEC_DATA, LOW);
-#else
-  pinMode(IEC_CLKOUT, OUTPUT);
-  pinMode(IEC_DATAOUT, OUTPUT);
-
-  digitalWrite(IEC_CLKOUT, HIGH);
-  digitalWrite(IEC_DATAOUT, HIGH);
-#endif
+  gpio_direction_output(IEC_CLK, LOW);
+  gpio_direction_output(IEC_DATA, LOW);
   
   if (!(iec_buffer = kmalloc(IEC_BUFSIZE * sizeof(uint16_t), GFP_KERNEL))) {
     printk(KERN_NOTICE "IEC: failed to allocate buffer\n");
@@ -1045,7 +976,7 @@ ssize_t iec_write(struct file *filp, const char __user *buf, size_t count, loff_
 #endif
 	  abort = iec_writeByte(val);
 	  if (abort) {
-	    printk(KERN_NOTICE "IEC: write abort %i\n", digitalRead(IEC_CLK));
+	    printk(KERN_NOTICE "IEC: write abort %i\n", gpio_get_value(IEC_CLK));
 	    len = 0;
 	  }
 	  else
