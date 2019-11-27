@@ -37,7 +37,8 @@ int main(int argc, char *argv[])
   
   for (count = 1; count < argc && count < 5; count++)
     dosMountDisk(argv[count], count - 1);
-
+ 
+  //iec8 will answer to device 8 commands?
   dosfd = open("/dev/iec8", O_RDWR);
   if (dosfd < 0)
     fprintf(stderr, "Unable to open IEC device\n");

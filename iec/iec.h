@@ -23,20 +23,28 @@
 #include <stdint.h>
 #endif
 
+/*
+ * OPEN 3,8,3,"0:FILE,S,W"
+ * 
+ *  8 --> IEC device 
+ *  3 --> Seconday address  ( 0-14 data channel, 15 -> command channel )
+ */
 typedef struct {
   unsigned char command;
-  unsigned char channel;
+  unsigned char channel;   
   uint16_t len;
   unsigned char eoi;
   unsigned char serial;
 } iec_data;
 
 enum {
-  IECListenCommand = 0x20,
-  IECTalkCommand = 0x40,
-  IECChannelCommand = 0x60,
-  IECCloseCommand = 0xe0,
-  IECOpenCommand = 0xf0,
+  IECListenCommand   = 0x20, // + device number (0-30) 
+  IECUnlistenCommand = 0x3F,
+  IECTalkCommand     = 0x40, // + device number (0-30)
+  IECUntalkCommand   = 0x5F,		    
+  IECChannelCommand  = 0x60, // + secondary address / channel (0-15)
+  IECCloseCommand    = 0xe0, // + secondary address / channel (0-15)
+  IECOpenCommand     = 0xf0, // + secondary address / channel (0-15)
 };
 
 #define IECFileCommand IECCloseCommand

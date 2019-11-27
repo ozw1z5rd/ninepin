@@ -196,8 +196,11 @@ static irqreturn_t iec_handleATN(int irq, void *dev_id, struct pt_regs *regs)
   if (atn) {
     iec_atnState = IECAttentionState;
     iec_state = IECWaitState;
+    // now we are listener...
+    // Talker pulls CLOCK to low ( true )
+    // Listener pulls Data to low ( true )
     gpio_direction_input(IEC_CLK);
-    gpio_direction_output(IEC_DATA,1);
+    gpio_direction_output(IEC_DATA, LOW);
   }
   else
     iec_atnState = IECWaitState;
@@ -316,6 +319,9 @@ void iec_sendInput(void)
   return;
 }
 
+/*
+ * Then the clock triggers, this function will read the data 
+ */
 static inline int iec_readByte(void)
 {
   unsigned long flags;
@@ -326,6 +332,7 @@ static inline int iec_readByte(void)
 
 
   local_irq_save(flags);
+
   gpio_direction_input(IEC_DATA);
 
   do_gettimeofday(&start);
@@ -632,13 +639,7 @@ int iec_init(void)
   /* http://www.makelinux.com/ldd3/ */
   /* http://stackoverflow.com/questions/5970595/create-a-device-node-in-code */
  
-  gpio_direction_input(IEC_ATN);
-  gpio_direction_input(IEC_CLK);
-  gpio_direction_input(IEC_DATA);
-
-  gpio_direction_output(IEC_CLK, LOW);
-  gpio_direction_output(IEC_DATA, LOW);
-  
+ 
   if (!(iec_buffer = kmalloc(IEC_BUFSIZE * sizeof(uint16_t), GFP_KERNEL))) {
     printk(KERN_NOTICE "IEC: failed to allocate buffer\n");
     result = -ENOMEM;
@@ -659,6 +660,26 @@ int iec_init(void)
     goto fail_data;
   }
 
+  gpio_direction_input(IEC_ATN);
+  gpio_direction_input(IEC_CLK);
+  gpio_direction_input(IEC_DATA);
+
+  /*
+   * Listener holds the DATA LOW ( TRUE )
+   * Talker   holds the CLOCK LOW ( TRUE )
+   * In this case we hold both the line low
+   */ 
+  gpio_direction_output(IEC_CLK, LOW);
+  gpio_direction_output(IEC_DATA, LOW);
+ 
+
+  /* 
+   * interrups on ATN and CLK 
+   * this avoids to poll the lines for state change
+   *
+   * When the computer will pull down ATN we will start listeing
+   * WHen clock changes, We can sample the bits.
+   */
   if ((irq_atn = gpio_to_irq(IEC_ATN)) < 0) {
     printk(KERN_NOTICE "IEC: GPIO to IRQ mapping faiure %s\n", LABEL_ATN);
     result = irq_atn;
@@ -860,6 +881,11 @@ int iec_unlinkIO(iec_device *device)
   return 1;
 }
     
+/*
+ * Reads the data, if avaialable and returns the data to the caller. 
+ * Blocking call
+ *
+ */
 ssize_t iec_read(struct file *filp, char *buf, size_t count, loff_t *f_pos)
 {
   unsigned long remaining;
