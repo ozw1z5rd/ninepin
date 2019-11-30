@@ -73,13 +73,23 @@
 /*
  * GPIO pins
  *
+ * it's better to use more gpio in a unidirectional way, it does not need
+ * time to switch between input and output mode and make things less noisy
+ * on the bus.
+ * Also, using more than 3 gpio make the code more readable.
  */
-#define IEC_ATN         25
-#define IEC_CLK         8
-#define IEC_DATA        7
-// new entries
-#define IEC_RESET       6
-#define IEC_SQR         5
+// commodore 64 will drive this line all the time
+#define IEC_ATNIN          25
+
+#define IEC_DATAIN        7
+#define IEC_DATAOUT       9
+#define IEC_CLKIN         8
+#define IEC_CLKOUT       10
+// new entries.
+// reset allow this device when drop anything
+// IEQ_SQR is used by the C128
+#define IEC_RESETIN       6
+#define IEC_SQR           5
 
 
 #define LABEL_ATN       "IEC attention pin"
@@ -155,304 +165,365 @@ static int                      c64slowdown = 10;
 DECLARE_WORK(iec_readWork, iec_processData);
 static DECLARE_WAIT_QUEUE_HEAD(iec_canRead);
 
-
+/*
+ * wait no more than delay us that pin goes to level val or pin2 to level val2
+ */
 static inline int iec_waitForSignals(int pin, int val, int pin2, int val2, int delay)
 {
-  struct timeval start, now;
-  int elapsed, abort = 0;
+    struct timeval start, now;
+    int elapsed, abort = 0;
 
-  do_gettimeofday(&start);
-  for (;;) {
-    if (gpio_get_value(pin) == val)
-      break;
-    if (pin2 && gpio_get_value(pin2) == val2)
-      break;
+    do_gettimeofday(&start);
+    for (;;) {
+        if (gpio_get_value(pin) == val)
+          break;
+        if (pin2 && gpio_get_value(pin2) == val2)
+          break;
 
-    do_gettimeofday(&now);
-    elapsed = (now.tv_sec - start.tv_sec) * 1000000 + (now.tv_usec - start.tv_usec);
-    if (elapsed >= delay) {
-      abort = 1;
-      break;
+        do_gettimeofday(&now);
+        elapsed = (now.tv_sec - start.tv_sec) * 1000000 + (now.tv_usec - start.tv_usec);
+        if (elapsed >= delay) {
+          abort = 1;
+          break;
+        }
     }
-  }
-
-  return abort;
+    return abort;
 }
 
+// TODO check this state
 void iec_releaseBus(void)
 {
-  gpio_direction_input(IEC_CLK);
-  gpio_direction_input(IEC_DATA);
-  udelay(c64slowdown);
-  return;
+    gpio_set_value(IEC_CLKOUT,  HIGH)
+    gpio_set_value(IEC_DATAOUT, HIGH)
+    udelay(c64slowdown);
+    return;
 }
 
+/*
+ * If the commodore 64 triggers the ATN, all devices must be switch
+ * in LISTENER STATE.
+ *
+ * The listener has to pull the DATA line to low ( TRUE ) the commodore 64 will
+ * read a TRUE ( low value ) after at least a listener put this line low.
+ */
 static irqreturn_t iec_handleATN(int irq, void *dev_id, struct pt_regs *regs)
 {
-  int atn;
-
-  atn = !gpio_get_value(IEC_ATN);
-  printk(KERN_NOTICE "IEC: attention %i\n", atn);
-  if (atn) {
-    iec_atnState = IECAttentionState;
-    iec_state = IECWaitState;
-    // now we are listener...
-    // Talker pulls CLOCK to low ( true )
-    // Listener pulls Data to low ( true )
-    gpio_direction_input(IEC_CLK);
-    gpio_direction_output(IEC_DATA, LOW);
-  }
-  else
-    iec_atnState = IECWaitState;
-  
-  return IRQ_HANDLED;
+    int atn;
+    // TRUE = LOW -> 0
+    atn = !gpio_get_value(IEC_ATNIN);
+    printk(KERN_NOTICE "IEC: attention %i\n", atn);
+    // if the ATN is really LOW (TRUE) we have to switch in LISTENER MODE
+    if (atn) {
+        iec_atnState = IECAttentionState;
+        iec_state = IECWaitState;
+        // clock will be TRUE if and only if the TALKER will change its state
+        gpio_set_value(IEC_CLKOUT,HIGH); // FALSE
+        // setting data to low we will allow the commodore 64 to understand that
+        // there is at least a listener on the bus
+        gpio_set_value(IEC_DATAOUT, LOW); // TRUE
+    }
+    else
+        iec_atnState = IECWaitState;
+    return IRQ_HANDLED;
 }
+
+
+/*
+ * The clock signal.
+ *
+ * When the talker has something to say, it will release the CLOCK.
+ * This can happens also when the ATN has how released, in this case the data
+ * are "service date"
+ */
+static irqreturn_t iec_handleCLK(int irq, void *dev_id, struct pt_regs *regs)
+{
+    int atn, val;
+    int cmd, dev;
+    int abort;
+
+
+    // Talker is ready to send us data, is the ATN released?
+    atn = !gpio_get_value(IEC_ATN);
+    if (!atn)
+        iec_atnState = IECWaitState;
+
+    printk(KERN_NOTICE "IEC: clock %i/%i %i\n", iec_atnState, atn, iec_state);
+    if (
+        iec_atnState != IECAttentionState &&
+        (   iec_state == IECWaitState
+         || iec_state == IECOutputState
+         || iec_state == IECTalkState)
+        )
+    return IRQ_HANDLED;
+
+    if (atn && iec_atnState == IECAttentionIgnoreState)
+        return IRQ_HANDLED;
+
+    abort = 0;
+
+    /* FIXME - if buffer is full waiting for userspace to read, we need to block! */
+    /* FIXME - if iec_readAvail is set then buffer is being sent */
+
+    // read the byte ( of course )
+    val = iec_readByte();
+    
+    //printk(KERN_NOTICE "IEC: Read: %03x %i %i\n", val, atn, iec_atnState);
+    
+    // we got a byte, ha been is sent in ATN ?
+    if (val >= 0) {
+        if (atn) {
+            // this will sign the data as "received under ATN
+            val |= DATA_ATN;
+
+            /* Partially processing commands that may need to release bus
+             here because of timing issues. */
+            
+            cmd = val & 0xe0; // command
+            dev = val & 0x1f; // device addressed
+            
+            /*
+             * Releases the bus if the command is not for the devices
+             * handled by this driver
+             */
+            switch (cmd) {
+                case IECListenCommand:
+                    if ( dev == IEC_ALLDEV || !iec_openDevices[dev]) {
+                          iec_atnState = IECAttentionIgnoreState;
+                          if (dev == IEC_ALLDEV)
+                              iec_state = IECWaitState;
+                          udelay(c64slowdown);
+                          iec_releaseBus();
+                    }
+                    break;
+
+                case IECTalkCommand:
+                    if (dev == IEC_ALLDEV || !iec_openDevices[dev]) {
+                        iec_atnState = IECAttentionIgnoreState;
+                        if (dev == IEC_ALLDEV)
+                            iec_state = IECWaitState;
+                        udelay(c64slowdown);
+                        iec_releaseBus();
+                    }
+                break;
+            }
+        }
+
+        // Stores the command,
+        iec_buffer[iec_inpos] = val;
+        iec_inpos = (iec_inpos + 1) % IEC_BUFSIZE;
+        queue_work(iec_readQ, &iec_readWork);
+    }
+    return IRQ_HANDLED;
+}
+
+
+/*
+ * This function will read a byte from the bus.
+ * and it's strictly time with no interrupts.
+ */
+static inline int iec_readByte(void)
+{
+    unsigned long flags;
+    int eoi, abort;
+    int len, bits;
+    struct timeval start, now;
+    int elapsed = 0;
+
+    // DISABLE INTERRUPT and save the status in flag.
+    local_irq_save(flags);
+
+    // we are here because the talker relesed the CLOCK.
+    // releasing the DATA we are telling: ok I'm ready to receive the data
+    gpio_set_value(IEC_DATAOUT, HIGH); // FALSE
+
+    // From now the talker must send the data within 200us.
+    // if this does not happens then the talker is telling us that
+    // the next charater will be the last one.
+    // after 200us of inactivity we notify to the talker that the
+    // EOI has been acknowledged.
+    // After this we wait the last char.
+    
+    do_gettimeofday(&start);
+    
+    /* this lopp runs until:
+     *
+     *  1. the CLOCK change state
+     *  2. we are waiting for more 100ms
+     */
+    for (abort = eoi = 0; !abort && gpio_get_value(IEC_CLKIN) ) {
+        do_gettimeofday(&now);
+        
+        elapsed = (now.tv_sec - start.tv_sec) * 1000000 + (now.tv_usec - start.tv_usec);
+
+        // acknoledge the EOI
+        // hopefully, 60 us seconds after this ACK the talker will send the last char
+        if (!eoi && elapsed >= 200) {
+            gpio_set_value(IEC_DATAOUT, LOW)
+            udelay(c64slowdown*2);
+            gpio_set_value(IEC_DATAOUT, HIGH)
+            eoi = DATA_EOI;
+        }
+
+        if (elapsed > 100000) {
+          printk(KERN_NOTICE "IEC: Timeout during start\n");
+          abort = 1;
+          break;
+        }
+    }
+    
+    // we are talking to the commodore 64, so the answer should be
+    // provided in around 60 us.
+    if (elapsed < 60) {
+        len = elapsed - c64slowdown;
+        if (len > 0 && c64slowdown / 10 < len && len > 5) {
+          c64slowdown = elapsed;
+          printk(KERN_NOTICE "IEC: calibrating delay: %i\n", elapsed);
+        }
+    }
+
+    /*
+     * gets 8 bits from the bus.
+     */
+    for (len = 0, bits = eoi; !abort && len < 8; len++) {
+        // wait CLOCK to go FALSE in 150us
+        if ((abort = iec_waitForSignals(IEC_CLKIN, 1, 0, 0, 150))) {
+          printk(KERN_NOTICE "IEC: timeout waiting for bit %i\n", len);
+          break;
+        }
+
+        if (gpio_get_value(IEC_DATAIN))
+            bits |= 1 << len;
+        // wait CLOCK to go TRUE in 150us
+        if (iec_waitForSignals(IEC_CLK, 0, 0, 0, 150)) {
+              printk(KERN_NOTICE "IEC: Timeout after bit %i\n", len);
+              if (len < 7)
+                  abort = 1;
+        }
+    }
+
+    gpio_set_value(IEC_DATAOUT, LOW);
+    
+    // ENABLE AGAIN THE INTERRUPS
+    local_irq_restore(flags);
+
+    udelay(c64slowdown);
+
+    if (abort)
+        return -1;
+
+    return bits;
+}
+
+
 
 void iec_newIO(int val)
 {
-  int dev;
-  iec_device *device;
-  iec_chain *chain;
-  iec_io *io;
-  static unsigned char serial = 0;
-  
-  dev = val & 0x1f;
-  device = iec_openDevices[dev];
-  if (!device)
+    int dev;
+    iec_device *device;
+    iec_chain *chain;
+    iec_io *io;
+    static unsigned char serial = 0;
+
+    dev = val & 0x1f;
+    device = iec_openDevices[dev];
+    if (!device)
+        return;
+
+    chain = &device->in;
+
+    /* FIXME - this shouldn't happen */
+    if (chain->cur)
+        printk(KERN_NOTICE "IEC: new IO with IO still open\n");
+
+    //printk(KERN_NOTICE "IEC: new IO\n");
+
+    io = kmalloc(sizeof(iec_io), GFP_KERNEL);
+    io->header.command = val & 0xff;
+    io->header.channel = 0;
+    io->header.len = 0;
+    io->header.eoi = 0;
+    io->header.serial = serial++;
+    io->next = NULL;
+    io->outpos = 0;
+
+    if (!chain->head)
+        chain->head = chain->tail = io;
+    else {
+        chain->tail->next = io;
+        chain->tail = io;
+    }
+    chain->cur = io;
+
     return;
-
-  chain = &device->in;
-  
-  /* FIXME - this shouldn't happen */
-  if (chain->cur)
-    printk(KERN_NOTICE "IEC: new IO with IO still open\n");
-
-  //printk(KERN_NOTICE "IEC: new IO\n");
-  
-  io = kmalloc(sizeof(iec_io), GFP_KERNEL);
-  io->header.command = val & 0xff;
-  io->header.channel = 0;
-  io->header.len = 0;
-  io->header.eoi = 0;
-  io->header.serial = serial++;
-  io->next = NULL;
-  io->outpos = 0;
-  
-  if (!chain->head)
-    chain->head = chain->tail = io;
-  else {
-    chain->tail->next = io;
-    chain->tail = io;
-  }
-  chain->cur = io;
-
-  return;
 }
 
 void iec_channelIO(int val)
 {
-  int cmd, chan;
-  iec_device *device;
-  iec_chain *chain;
+    int chan;
+    iec_device *device;
+    iec_chain *chain;
 
+    chan = val & 0x0f;
 
-  cmd = val & 0xf0;
-  chan = val & 0x0f;
-  
-  if (!(device = iec_openDevices[iec_curDevice]))
+    if (!(device = iec_openDevices[iec_curDevice]))
+        return;
+    //printk(KERN_NOTICE "IEC: changing channel to %i\n", chan);
+    iec_curChannel = chan;
+    chain = &device->in;
+    if (!chain->cur)
+        return;
+    
+    chain->cur->header.channel = val & 0xff;
     return;
-  //printk(KERN_NOTICE "IEC: changing channel to %i\n", chan);
-  iec_curChannel = chan;
-  chain = &device->in;
-  if (!chain->cur)
-    return;
-
-  chain->cur->header.channel = val & 0xff;
-
-  return;
 }
 
 void iec_appendByte(int val)
 {
-  iec_device *device;
-  iec_chain *chain;
-  iec_io *io;
+    iec_device *device;
+    iec_chain *chain;
+    iec_io *io;
 
+    if (!(device = iec_openDevices[iec_curDevice]))
+        return;
 
-  if (!(device = iec_openDevices[iec_curDevice]))
+    chain = &device->in;
+    if (!(io = chain->cur))
+        return;
+
+    val = val & 0xff;
+    io->data[io->header.len] = val;
+    io->header.len++;
+
     return;
-
-  chain = &device->in;
-  if (!(io = chain->cur))
-    return;
-
-  val = val & 0xff;
-  io->data[io->header.len] = val;
-  io->header.len++;
-
-  return;
 }
 
 void iec_sendInput(void)
 {
-  iec_device *device;
-  iec_chain *chain;
-  iec_io *io;
+    iec_device *device;
+    iec_chain *chain;
+    iec_io *io;
 
 
-  if (!(device = iec_openDevices[iec_curDevice]))
+    if (!(device = iec_openDevices[iec_curDevice]))
+        return;
+
+    /* FIXME - if we are holding the bus because of this device, release the bus */
+
+    chain = &device->in;
+    if (!chain->cur)
+        return;
+
+    //printk(KERN_NOTICE "IEC: sending input\n");
+
+    io = chain->cur;
+    chain->cur = NULL;
+    iec_readAvail = 1;
+    wake_up_interruptible(&iec_canRead);
+
     return;
-
-  /* FIXME - if we are holding the bus because of this device, release the bus */
-  
-  chain = &device->in;
-  if (!chain->cur)
-    return;
-
-  //printk(KERN_NOTICE "IEC: sending input\n");
-  
-  io = chain->cur;
-  chain->cur = NULL;
-  iec_readAvail = 1;
-  wake_up_interruptible(&iec_canRead);
-
-  return;
-}
-
-/*
- * Then the clock triggers, this function will read the data 
- */
-static inline int iec_readByte(void)
-{
-  unsigned long flags;
-  int eoi, abort;
-  int len, bits;
-  struct timeval start, now;
-  int elapsed = 0;
-
-
-  local_irq_save(flags);
-
-  gpio_direction_input(IEC_DATA);
-
-  do_gettimeofday(&start);
-  for (abort = eoi = 0; !abort && gpio_get_value(IEC_CLK); ) {
-    do_gettimeofday(&now);
-    elapsed = (now.tv_sec - start.tv_sec) * 1000000 + (now.tv_usec - start.tv_usec);
-
-    if (!eoi && elapsed >= 200) {
-      gpio_direction_output(IEC_DATA,0);
-      udelay(c64slowdown*2);
-      gpio_direction_input(IEC_DATA);
-      eoi = DATA_EOI;
-    }
-
-    if (elapsed > 100000) {
-      printk(KERN_NOTICE "IEC: Timeout during start\n");
-      abort = 1;
-      break;
-    }
-  }
-
-  if (elapsed < 60) {
-    len = elapsed - c64slowdown;
-    if (len > 0 && c64slowdown / 10 < len && len > 5) {
-      c64slowdown = elapsed;
-      printk(KERN_NOTICE "IEC: calibrating delay: %i\n", elapsed);
-    }
-  }
-
-  for (len = 0, bits = eoi; !abort && len < 8; len++) {
-    if ((abort = iec_waitForSignals(IEC_CLK, 1, 0, 0, 150))) {
-      printk(KERN_NOTICE "IEC: timeout waiting for bit %i\n", len);
-      break;
-    }
-
-    if (gpio_get_value(IEC_DATA))
-      bits |= 1 << len;
-
-    if (iec_waitForSignals(IEC_CLK, 0, 0, 0, 150)) {
-      printk(KERN_NOTICE "IEC: Timeout after bit %i\n", len);
-      if (len < 7)
-        abort = 1;
-    }
-  }
-
-  gpio_direction_output(IEC_DATA, 1);
-  local_irq_restore(flags);
-  
-  udelay(c64slowdown);
-
-  if (abort)
-    return -1;
-
-  return bits;
 }
   
-static irqreturn_t iec_handleCLK(int irq, void *dev_id, struct pt_regs *regs)
-{
-  int atn, val;
-  int cmd, dev;
-  int abort;
 
-
-  atn = !gpio_get_value(IEC_ATN);
-  if (!atn)
-    iec_atnState = IECWaitState;
-  
-  printk(KERN_NOTICE "IEC: clock %i/%i %i\n", iec_atnState, atn, iec_state);
-  if (iec_atnState != IECAttentionState &&
-      (iec_state == IECWaitState || iec_state == IECOutputState || iec_state == IECTalkState))
-    return IRQ_HANDLED;
-
-  if (atn && iec_atnState == IECAttentionIgnoreState)
-    return IRQ_HANDLED;
-
-  abort = 0;
-
-  /* FIXME - if buffer is full waiting for userspace to read, we need to block! */
-  /* FIXME - if iec_readAvail is set then buffer is being sent */
-  
-  val = iec_readByte();
-  //printk(KERN_NOTICE "IEC: Read: %03x %i %i\n", val, atn, iec_atnState);
-  if (val >= 0) {
-    if (atn) { 
-      val |= DATA_ATN;
-
-      /* Partially processing commands that may need to release bus
-         here because of timing issues. */
-      cmd = val & 0xe0;
-      dev = val & 0x1f;
-      switch (cmd) {
-      case IECListenCommand:
-        if (dev == IEC_ALLDEV || !iec_openDevices[dev]) {
-          iec_atnState = IECAttentionIgnoreState;
-          if (dev == IEC_ALLDEV)
-            iec_state = IECWaitState;
-          udelay(c64slowdown);
-          iec_releaseBus();
-        }
-        break;
-
-      case IECTalkCommand:
-        if (dev == IEC_ALLDEV || !iec_openDevices[dev]) {
-          iec_atnState = IECAttentionIgnoreState;
-          if (dev == IEC_ALLDEV)
-            iec_state = IECWaitState;
-          udelay(c64slowdown);
-          iec_releaseBus();
-        }
-        break;
-      }
-    }
-
-    iec_buffer[iec_inpos] = val;
-    iec_inpos = (iec_inpos + 1) % IEC_BUFSIZE;
-    queue_work(iec_readQ, &iec_readWork);
-  }
-  
-  return IRQ_HANDLED;
-}
 
 int iec_setupTalker(void)
 {
@@ -553,82 +624,80 @@ static void iec_processData(struct work_struct *work)
 
 int iec_writeByte(int bits)
 {
-  int len;
-  int abort = 0;
-  unsigned long flags;
+    int len;
+    int abort = 0;
+    unsigned long flags;
 
-
-  if (!gpio_get_value(IEC_ATN) || iec_state != IECOutputState) {
-    printk(KERN_NOTICE "IEC: attention before write\n");
-    return 1;
-  }
-  
-  disable_irq(irq_clk);
-  local_irq_save(flags);
-  //printk(KERN_NOTICE "IEC: Write: %03x data: %i\n", bits, gpio_get_value(IEC_DATA));
-  gpio_direction_input(IEC_CLK);
-
-  if ((abort = iec_waitForSignals(IEC_DATA, 1, IEC_ATN, 0, 100000)))
-    printk(KERN_NOTICE "IEC: Timeout waiting to send\n");
-
-  /* Because interrupts are disabled it's possible to miss the ATN pause signal */
-  if (!gpio_get_value(IEC_ATN)) {
-    printk(KERN_NOTICE "IEC: attention before send\n");
-    iec_state = IECWaitState;
-    iec_atnState = IECAttentionState;
-    abort = 1;
-  }
-  
-  if (!abort && (bits & DATA_EOI)) {
-    if ((abort = iec_waitForSignals(IEC_DATA, 0, IEC_ATN, 0, 100000)))
-      printk(KERN_NOTICE "IEC: Timeout waiting for EOI ack\n");
-
-    if (!abort && (abort = iec_waitForSignals(IEC_DATA, 1, IEC_ATN, 0, 100000)))
-      printk(KERN_NOTICE "IEC: Timeout waiting for EOI ack finish\n");
-  }
-
-  gpio_direction_output(IEC_CLK,0);
-  local_irq_restore(flags);
-  udelay(c64slowdown);
-  
-  for (len = 0; !abort && len < 8; len++, bits >>= 1) {
-    if (!gpio_get_value(IEC_ATN) || iec_state != IECOutputState) {
-      printk(KERN_NOTICE "IEC: attention during write\n");
-      abort = 1;
-      break;
+    if (!gpio_get_value(IEC_ATNIN) || iec_state != IECOutputState) {
+        printk(KERN_NOTICE "IEC: attention before write\n");
+        return 1;
     }
-    if (bits & 1)
-      gpio_direction_input(IEC_DATA);
-    else
-      gpio_direction_output(IEC_DATA, 1);
 
-    udelay(c64slowdown*2);
-    gpio_direction_input(IEC_CLK);
-    udelay(c64slowdown*2);
-    gpio_direction_input(IEC_DATA);
-    gpio_direction_output(IEC_CLK, 1);
-  }
-  enable_irq(irq_clk);
+    // disable the IRQ on che CLOCK line
+    disable_irq(irq_clk);
+    // Disable all the interrupts?
+    local_irq_save(flags);
 
-  if (!abort && (abort = iec_waitForSignals(IEC_DATA, 0, IEC_ATN, 0, 10000))) {
-    if (gpio_get_value(IEC_ATN)) {
-      printk(KERN_NOTICE "IEC: Timeout waiting for listener ack\n");
-      abort = 0;
+    //printk(KERN_NOTICE "IEC: Write: %03x data: %i\n", bits, gpio_get_value(IEC_DATA));
+    gpio_set_value(IEC_CLKOUT, HIGH);
+
+    if ((abort = iec_waitForSignals(IEC_DATAIN, 1, IEC_ATNIN, 0, 100000)))
+        printk(KERN_NOTICE "IEC: Timeout waiting to send\n");
+
+    /* Because interrupts are disabled it's possible to miss the ATN pause signal */
+    if (!gpio_get_value(IEC_ATNIN)) {
+        printk(KERN_NOTICE "IEC: attention before send\n");
+        iec_state = IECWaitState;
+        iec_atnState = IECAttentionState;
+        abort = 1;
     }
-    else {
-      printk(KERN_NOTICE "IEC: attention after write\n");
-      iec_state = IECWaitState;
-      iec_atnState = IECAttentionState;
+
+    if (!abort && (bits & DATA_EOI)) {
+        if ((abort = iec_waitForSignals(IEC_DATAIN, 0, IEC_ATNIN, 0, 100000)))
+          printk(KERN_NOTICE "IEC: Timeout waiting for EOI ack\n");
+
+        if (!abort && (abort = iec_waitForSignals(IEC_DATAIN, 1, IEC_ATNIN, 0, 100000)))
+          printk(KERN_NOTICE "IEC: Timeout waiting for EOI ack finish\n");
     }
-  }
 
-  udelay(c64slowdown);
+    gpio_set_value(IEC_CLKOUT,LOW);
+    local_irq_restore(flags);
+    udelay(c64slowdown);
 
-  if (abort && !gpio_get_value(IEC_ATN)) {
-    gpio_direction_input(IEC_CLK);
-  }
-  
-  return abort;
+    for (len = 0; !abort && len < 8; len++, bits >>= 1) {
+        if (!gpio_get_value(IEC_ATN) || iec_state != IECOutputState) {
+            printk(KERN_NOTICE "IEC: attention during write\n");
+            abort = 1;
+            break;
+        }
+        gpio_set_value(IEC_DATAOUT, bits & 1)
+        udelay(c64slowdown*2);
+        gpio_set_value(IEC_CLKOUT, HIGH);
+        udelay(c64slowdown*2);
+        
+        gpio_set_value(IEC_DATAOUT, HIGH);
+        gpio_set_value(IEC_CLKOUT, LOW);
+    }
+    enable_irq(irq_clk);
+
+    if (!abort && (abort = iec_waitForSignals(IEC_DATA, 0, IEC_ATN, 0, 10000))) {
+        if (gpio_get_value(IEC_ATN)) {
+            printk(KERN_NOTICE "IEC: Timeout waiting for listener ack\n");
+            abort = 0;
+        }
+        else {
+            printk(KERN_NOTICE "IEC: attention after write\n");
+            iec_state = IECWaitState;
+            iec_atnState = IECAttentionState;
+        }
+    }
+
+    udelay(c64slowdown);
+
+    if (abort && !gpio_get_value(IEC_ATN))
+        gpio_set_value(IEC_CLKOUT, HIGH);
+    
+    return abort;
 }
 
 int iec_init(void)
