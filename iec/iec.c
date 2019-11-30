@@ -95,12 +95,14 @@
 #define IEC_SQR           5
 
 
-#define LABEL_ATN       "IEC attention pin"
-#define LABEL_CLK       "IEC clock pin"
-#define LABEL_DATA      "IEC data pin"
-#define LABEL_DEVICE    "iec"
-#define LABEL_WRITE     "IEC write queue"
-#define LABEL_READ      "IEC read queue"
+#define LABEL_ATNIN       "IEC attention pin (IN)"
+#define LABEL_CLKIN       "IEC clock pin (IN)"
+#define LABEL_DATAIN      "IEC data pin (IN)"
+#define LABEL_CLKOUT      "IEC clock pin (OUT)"
+#define LABEL_DATAOUT     "IEC data pin (OUT)"
+#define LABEL_DEVICE      "iec"
+#define LABEL_WRITE       "IEC write queue"
+#define LABEL_READ        "IEC read queue"
 
 #define DATA_EOI        0x100
 #define DATA_ATN        0x200
@@ -203,8 +205,8 @@ static inline int iec_waitForSignals(int pin, int val, int pin2, int val2, int d
 // TODO check this state
 void iec_releaseBus(void)
 {
-    gpio_set_value(IEC_CLKOUT,  HIGH)
-    gpio_set_value(IEC_DATAOUT, HIGH)
+    gpio_set_value(IEC_CLKOUT,  HIGH);
+    gpio_set_value(IEC_DATAOUT, HIGH);
     udelay(c64slowdown);
     return;
 }
@@ -236,6 +238,104 @@ static irqreturn_t iec_handleATN(int irq, void *dev_id, struct pt_regs *regs)
         iec_atnState = IECWaitState;
     return IRQ_HANDLED;
 }
+
+/*
+ * This function will read a byte from the bus.
+ * and it's strictly time with no interrupts.
+ */
+static inline int iec_readByte(void)
+{
+    unsigned long flags;
+    int eoi, abort;
+    int len, bits;
+    struct timeval start, now;
+    int elapsed = 0;
+
+    // DISABLE INTERRUPT and save the status in flag.
+    local_irq_save(flags);
+
+    // we are here because the talker relesed the CLOCK.
+    // releasing the DATA we are telling: ok I'm ready to receive the data
+    gpio_set_value(IEC_DATAOUT, HIGH); // FALSE
+
+    // From now the talker must send the data within 200us.
+    // if this does not happens then the talker is telling us that
+    // the next charater will be the last one.
+    // after 200us of inactivity we notify to the talker that the
+    // EOI has been acknowledged.
+    // After this we wait the last char.
+    
+    do_gettimeofday(&start);
+    
+    /* this lopp runs until:
+     *
+     *  1. the CLOCK change state
+     *  2. we are waiting for more 100ms
+     */
+    for (abort = eoi = 0; !abort && gpio_get_value(IEC_CLKIN); ) {
+        do_gettimeofday(&now);
+        
+        elapsed = (now.tv_sec - start.tv_sec) * 1000000 + (now.tv_usec - start.tv_usec);
+
+        // acknoledge the EOI
+        // hopefully, 60 us seconds after this ACK the talker will send the last char
+        if (!eoi && elapsed >= 200) {
+            gpio_set_value(IEC_DATAOUT, LOW);
+            udelay(c64slowdown<<1);
+            gpio_set_value(IEC_DATAOUT, HIGH);
+            eoi = DATA_EOI;
+        }
+
+        if (elapsed > 100000) {
+          printk(KERN_NOTICE "IEC: Timeout during start\n");
+          abort = 1;
+          break;
+        }
+    }
+    
+    // we are talking to the commodore 64, so the answer should be
+    // provided in around 60 us.
+    if (elapsed < 60) {
+        len = elapsed - c64slowdown;
+        if (len > 0 && c64slowdown / 10 < len && len > 5) {
+          c64slowdown = elapsed;
+          printk(KERN_NOTICE "IEC: calibrating delay: %i\n", elapsed);
+        }
+    }
+
+    /*
+     * gets 8 bits from the bus.
+     */
+    for (len = 0, bits = eoi; !abort && len < 8; len++) {
+        // wait CLOCK to go FALSE in 150us  ____-----
+        if ((abort = iec_waitForSignals(IEC_CLKIN, 1, 0, 0, 150))) {
+          printk(KERN_NOTICE "IEC: timeout waiting for bit %i\n", len);
+          break;
+        }
+
+        if (gpio_get_value(IEC_DATAIN))
+            bits |= 1 << len;
+        // wait CLOCK to go TRUE in 150us -----_____
+        if (iec_waitForSignals(IEC_CLKIN, 0, 0, 0, 150)) {
+              printk(KERN_NOTICE "IEC: Timeout after bit %i\n", len);
+              if (len < 7)
+                  abort = 1;
+        }
+    }
+
+    gpio_set_value(IEC_DATAOUT, LOW);
+    
+    // ENABLE AGAIN THE INTERRUPTS
+    local_irq_restore(flags);
+
+    udelay(c64slowdown);
+
+    if (abort)
+        return -1;
+
+    return bits;
+}
+
 
 
 /*
@@ -323,104 +423,6 @@ static irqreturn_t iec_handleCLK(int irq, void *dev_id, struct pt_regs *regs)
         queue_work(iec_readQ, &iec_readWork);
     }
     return IRQ_HANDLED;
-}
-
-
-/*
- * This function will read a byte from the bus.
- * and it's strictly time with no interrupts.
- */
-static inline int iec_readByte(void)
-{
-    unsigned long flags;
-    int eoi, abort;
-    int len, bits;
-    struct timeval start, now;
-    int elapsed = 0;
-
-    // DISABLE INTERRUPT and save the status in flag.
-    local_irq_save(flags);
-
-    // we are here because the talker relesed the CLOCK.
-    // releasing the DATA we are telling: ok I'm ready to receive the data
-    gpio_set_value(IEC_DATAOUT, HIGH); // FALSE
-
-    // From now the talker must send the data within 200us.
-    // if this does not happens then the talker is telling us that
-    // the next charater will be the last one.
-    // after 200us of inactivity we notify to the talker that the
-    // EOI has been acknowledged.
-    // After this we wait the last char.
-    
-    do_gettimeofday(&start);
-    
-    /* this lopp runs until:
-     *
-     *  1. the CLOCK change state
-     *  2. we are waiting for more 100ms
-     */
-    for (abort = eoi = 0; !abort && gpio_get_value(IEC_CLKIN) ) {
-        do_gettimeofday(&now);
-        
-        elapsed = (now.tv_sec - start.tv_sec) * 1000000 + (now.tv_usec - start.tv_usec);
-
-        // acknoledge the EOI
-        // hopefully, 60 us seconds after this ACK the talker will send the last char
-        if (!eoi && elapsed >= 200) {
-            gpio_set_value(IEC_DATAOUT, LOW)
-            udelay(c64slowdown<<1);
-            gpio_set_value(IEC_DATAOUT, HIGH)
-            eoi = DATA_EOI;
-        }
-
-        if (elapsed > 100000) {
-          printk(KERN_NOTICE "IEC: Timeout during start\n");
-          abort = 1;
-          break;
-        }
-    }
-    
-    // we are talking to the commodore 64, so the answer should be
-    // provided in around 60 us.
-    if (elapsed < 60) {
-        len = elapsed - c64slowdown;
-        if (len > 0 && c64slowdown / 10 < len && len > 5) {
-          c64slowdown = elapsed;
-          printk(KERN_NOTICE "IEC: calibrating delay: %i\n", elapsed);
-        }
-    }
-
-    /*
-     * gets 8 bits from the bus.
-     */
-    for (len = 0, bits = eoi; !abort && len < 8; len++) {
-        // wait CLOCK to go FALSE in 150us  ____-----
-        if ((abort = iec_waitForSignals(IEC_CLKIN, 1, 0, 0, 150))) {
-          printk(KERN_NOTICE "IEC: timeout waiting for bit %i\n", len);
-          break;
-        }
-
-        if (gpio_get_value(IEC_DATAIN))
-            bits |= 1 << len;
-        // wait CLOCK to go TRUE in 150us -----_____
-        if (iec_waitForSignals(IEC_CLK, 0, 0, 0, 150)) {
-              printk(KERN_NOTICE "IEC: Timeout after bit %i\n", len);
-              if (len < 7)
-                  abort = 1;
-        }
-    }
-
-    gpio_set_value(IEC_DATAOUT, LOW);
-    
-    // ENABLE AGAIN THE INTERRUPTS
-    local_irq_restore(flags);
-
-    udelay(c64slowdown);
-
-    if (abort)
-        return -1;
-
-    return bits;
 }
 
 
@@ -695,12 +697,12 @@ int iec_writeByte(int bits)
     udelay(c64slowdown);
 
     for (len = 0; !abort && len < 8; len++, bits >>= 1) {
-        if (!gpio_get_value(IEC_ATN) || iec_state != IECOutputState) {
+        if (!gpio_get_value(IEC_ATNIN) || iec_state != IECOutputState) {
             printk(KERN_NOTICE "IEC: attention during write\n");
             abort = 1;
             break;
         }
-        gpio_set_value(IEC_DATAOUT, bits & 0X01)
+        gpio_set_value(IEC_DATAOUT, bits & 0X01);
         udelay(c64slowdown<<1);
         gpio_set_value(IEC_CLKOUT, HIGH);
         udelay(c64slowdown<<1);
@@ -710,8 +712,8 @@ int iec_writeByte(int bits)
     }
     enable_irq(irq_clk);
 
-    if (!abort && (abort = iec_waitForSignals(IEC_DATA, 0, IEC_ATN, 0, 10000))) {
-        if (gpio_get_value(IEC_ATN)) {
+    if (!abort && (abort = iec_waitForSignals(IEC_DATAIN, 0, IEC_ATNIN, 0, 10000))) {
+        if (gpio_get_value(IEC_ATNIN)) {
             printk(KERN_NOTICE "IEC: Timeout waiting for listener ack\n");
             abort = 0;
         }
@@ -724,7 +726,7 @@ int iec_writeByte(int bits)
 
     udelay(c64slowdown);
 
-    if (abort && !gpio_get_value(IEC_ATN))
+    if (abort && !gpio_get_value(IEC_ATNIN))
         gpio_set_value(IEC_CLKOUT, HIGH);
     
     return abort;
@@ -749,23 +751,23 @@ int iec_init(void)
     iec_inpos = iec_outpos = 0;
 
     if ((result = gpio_request(IEC_ATNIN, LABEL_ATNIN))) {
-        printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_ATN);
+        printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_ATNIN);
         goto fail_atnin;
     }
     if ((result = gpio_request(IEC_CLKIN, LABEL_CLKIN))) {
-        printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_CLK);
+        printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_CLKIN);
         goto fail_clkin;
     }
     if ((result = gpio_request(IEC_DATAIN, LABEL_DATAIN))) {
-        printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_DATA);
+        printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_DATAIN);
         goto fail_datain;
     }
     if ((result = gpio_request(IEC_CLKOUT, LABEL_CLKOUT))) {
-        printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_CLK);
+        printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_CLKIN);
         goto fail_clkout;
     }
     if ((result = gpio_request(IEC_DATAOUT, LABEL_DATAOUT))) {
-        printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_DATA);
+        printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_DATAIN);
         goto fail_dataout;
     }
 
@@ -773,8 +775,8 @@ int iec_init(void)
     gpio_direction_input(IEC_ATNIN);
     gpio_direction_input(IEC_CLKIN);
     gpio_direction_input(IEC_DATAIN);
-    gpio_direction_output(IEC_DATAOUT, HIGH)
-    gpio_direction_output(IEC_CLKOUT, HIGH)
+    gpio_direction_output(IEC_DATAOUT, HIGH);
+    gpio_direction_output(IEC_CLKOUT, HIGH);
     
     /*
     * interrups on ATN and CLK
@@ -784,13 +786,13 @@ int iec_init(void)
     * WHen clock changes, We can sample the bits.
     */
     if ((irq_atn = gpio_to_irq(IEC_ATNIN)) < 0) {
-        printk(KERN_NOTICE "IEC: GPIO to IRQ mapping faiure %s\n", LABEL_ATN);
+        printk(KERN_NOTICE "IEC: GPIO to IRQ mapping faiure %s\n", LABEL_ATNIN);
         result = irq_atn;
         goto fail_mapatn;
     }
 
     if ((irq_clk = gpio_to_irq(IEC_CLKIN)) < 0) {
-        printk(KERN_NOTICE "IEC: GPIO to IRQ mapping faiure %s\n", LABEL_CLK);
+        printk(KERN_NOTICE "IEC: GPIO to IRQ mapping faiure %s\n", LABEL_CLKIN);
         result = irq_clk;
         goto fail_mapclk;
     }
@@ -798,18 +800,18 @@ int iec_init(void)
     /* FIXME - don't enable interrupts until user space opens driver */
     if ((result = request_irq(irq_atn, (irq_handler_t) iec_handleATN,
                             IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
-                            LABEL_ATN, LABEL_DEVICE))) {
+                            LABEL_ATNIN, LABEL_DEVICE))) {
         printk(KERN_NOTICE "IEC: IRQ Request failure\n");
         goto fail_irqatn;
     }
 
     if ((result = request_irq(irq_clk, (irq_handler_t) iec_handleCLK,
-                            IRQF_TRIGGER_RISING, LABEL_CLK, LABEL_DEVICE))) {
+                            IRQF_TRIGGER_RISING, LABEL_CLKIN, LABEL_DEVICE))) {
         printk(KERN_NOTICE "IEC: IRQ Request failure\n");
         goto fail_irqclk;
     }
 
-    if ((result = alloc_chrdev_region(&iec_devno, 0, IEC_ALLDEV, LABEL_DEVICE)) < 0) {
+    if ((result = alloc_chrdev_region(&iec_devno, IEC_FIRSTDEV, IEC_ALLDEV, LABEL_DEVICE)) < 0) {
         printk(KERN_NOTICE "IEC: cannot register device\n");
         goto fail_chrdev;
     }
@@ -843,11 +845,11 @@ int iec_init(void)
     fail_cdevadd:
         unregister_chrdev_region(iec_devno, IEC_ALLDEV);
     fail_chrdev:
+	free_irq(irq_clk, LABEL_DEVICE);
     fail_irqclk:
         free_irq(irq_atn, LABEL_DEVICE);
     fail_irqatn:
     fail_mapclk:
-        free_irq(IEC_ATNIN);
     fail_mapatn:
     fail_dataout:
         gpio_free(IEC_DATAOUT);
@@ -1127,7 +1129,7 @@ ssize_t iec_write(struct file *filp, const char __user *buf, size_t count, loff_
 #endif
                     abort = iec_writeByte(val);
                     if (abort) {
-                        printk(KERN_NOTICE "IEC: write abort %i\n", gpio_get_value(IEC_CLK));
+                        printk(KERN_NOTICE "IEC: write abort %i\n", gpio_get_value(IEC_CLKIN));
                         len = 0;
                     }
                     else
