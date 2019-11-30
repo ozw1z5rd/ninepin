@@ -43,7 +43,9 @@
 #define DRIVER_AUTHOR   "Chris Osborn <fozztexx@fozztexx.com>"
 #define DRIVER_DESC     "Commodore IEC serial driver"
 
+//
 #define IEC_BUFSIZE     1024
+
 /*
  * Device ID    Device Type     Serial Bus
  * 0            Keyboard        NO      
@@ -69,7 +71,8 @@
 #define IEC_FIRSTDEV    4
 #define IEC_LASTDEV     15
 #define IEC_ALLDEV      (IEC_LASTDEV - IEC_FIRSTDEV)
-
+// when talker sends this device number it is addressing all the devices
+#define IEC_BROADCAST   31
 /*
  * GPIO pins
  *
@@ -140,18 +143,25 @@ static void         iec_processData(struct work_struct *work);
        ssize_t      iec_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
 
 struct file_operations iec_fops = {
- owner:   THIS_MODULE,
- read:    iec_read,
- write:   iec_write,
- poll:    iec_poll,
- open:    iec_open,
- release: iec_close
+    owner:   THIS_MODULE,
+    read:    iec_read,
+    write:   iec_write,
+    poll:    iec_poll,
+    open:    iec_open,
+    release: iec_close
 };
 
+/* This array holds the status of the open devices.
+ * Every time a process opens a device, we store the information of the
+ * device inside this structure. The minor of the device is the used to
+ * address the record in it.
+ */
 static iec_device              *iec_openDevices[IEC_ALLDEV+1];
 // how much devices have been opened
 static int                      iec_curDevice, iec_curChannel;
+
 static int                      iec_readAvail = 0;
+
 static short int                irq_atn = 0, irq_clk = 0;
 static dev_t                    iec_devno;
 static struct cdev              iec_cdev;
@@ -212,7 +222,7 @@ static irqreturn_t iec_handleATN(int irq, void *dev_id, struct pt_regs *regs)
     // TRUE = LOW -> 0
     atn = !gpio_get_value(IEC_ATNIN);
     printk(KERN_NOTICE "IEC: attention %i\n", atn);
-    // if the ATN is really LOW (TRUE) we have to switch in LISTENER MODE
+    // if the ATN is LOW (TRUE) we have to switch in LISTENER MODE
     if (atn) {
         iec_atnState = IECAttentionState;
         iec_state = IECWaitState;
@@ -232,8 +242,8 @@ static irqreturn_t iec_handleATN(int irq, void *dev_id, struct pt_regs *regs)
  * The clock signal.
  *
  * When the talker has something to say, it will release the CLOCK.
- * This can happens also when the ATN has how released, in this case the data
- * are "service date"
+ * This can happens also when the ATN is stil active, in this case the data
+ * are "service data"
  */
 static irqreturn_t iec_handleCLK(int irq, void *dev_id, struct pt_regs *regs)
 {
@@ -241,9 +251,8 @@ static irqreturn_t iec_handleCLK(int irq, void *dev_id, struct pt_regs *regs)
     int cmd, dev;
     int abort;
 
-
     // Talker is ready to send us data, is the ATN released?
-    atn = !gpio_get_value(IEC_ATN);
+    atn = !gpio_get_value(IEC_ATNIN);
     if (!atn)
         iec_atnState = IECWaitState;
 
@@ -287,9 +296,9 @@ static irqreturn_t iec_handleCLK(int irq, void *dev_id, struct pt_regs *regs)
              */
             switch (cmd) {
                 case IECListenCommand:
-                    if ( dev == IEC_ALLDEV || !iec_openDevices[dev]) {
+                    if ( dev == IEC_BROADCAST || !iec_openDevices[dev]) {
                           iec_atnState = IECAttentionIgnoreState;
-                          if (dev == IEC_ALLDEV)
+                          if (dev == IEC_BROADCAST)
                               iec_state = IECWaitState;
                           udelay(c64slowdown);
                           iec_releaseBus();
@@ -297,9 +306,9 @@ static irqreturn_t iec_handleCLK(int irq, void *dev_id, struct pt_regs *regs)
                     break;
 
                 case IECTalkCommand:
-                    if (dev == IEC_ALLDEV || !iec_openDevices[dev]) {
+                    if (dev == IEC_BROADCAST || !iec_openDevices[dev]) {
                         iec_atnState = IECAttentionIgnoreState;
-                        if (dev == IEC_ALLDEV)
+                        if (dev == IEC_BROADCAST)
                             iec_state = IECWaitState;
                         udelay(c64slowdown);
                         iec_releaseBus();
@@ -310,7 +319,7 @@ static irqreturn_t iec_handleCLK(int irq, void *dev_id, struct pt_regs *regs)
 
         // Stores the command,
         iec_buffer[iec_inpos] = val;
-        iec_inpos = (iec_inpos + 1) % IEC_BUFSIZE;
+        iec_inpos = ++iec_inpos % IEC_BUFSIZE;
         queue_work(iec_readQ, &iec_readWork);
     }
     return IRQ_HANDLED;
@@ -359,7 +368,7 @@ static inline int iec_readByte(void)
         // hopefully, 60 us seconds after this ACK the talker will send the last char
         if (!eoi && elapsed >= 200) {
             gpio_set_value(IEC_DATAOUT, LOW)
-            udelay(c64slowdown*2);
+            udelay(c64slowdown<<1);
             gpio_set_value(IEC_DATAOUT, HIGH)
             eoi = DATA_EOI;
         }
@@ -385,7 +394,7 @@ static inline int iec_readByte(void)
      * gets 8 bits from the bus.
      */
     for (len = 0, bits = eoi; !abort && len < 8; len++) {
-        // wait CLOCK to go FALSE in 150us
+        // wait CLOCK to go FALSE in 150us  ____-----
         if ((abort = iec_waitForSignals(IEC_CLKIN, 1, 0, 0, 150))) {
           printk(KERN_NOTICE "IEC: timeout waiting for bit %i\n", len);
           break;
@@ -393,7 +402,7 @@ static inline int iec_readByte(void)
 
         if (gpio_get_value(IEC_DATAIN))
             bits |= 1 << len;
-        // wait CLOCK to go TRUE in 150us
+        // wait CLOCK to go TRUE in 150us -----_____
         if (iec_waitForSignals(IEC_CLK, 0, 0, 0, 150)) {
               printk(KERN_NOTICE "IEC: Timeout after bit %i\n", len);
               if (len < 7)
@@ -403,7 +412,7 @@ static inline int iec_readByte(void)
 
     gpio_set_value(IEC_DATAOUT, LOW);
     
-    // ENABLE AGAIN THE INTERRUPS
+    // ENABLE AGAIN THE INTERRUPTS
     local_irq_restore(flags);
 
     udelay(c64slowdown);
@@ -415,7 +424,17 @@ static inline int iec_readByte(void)
 }
 
 
-
+/*
+ * opens a new IO
+ *
+ * That is something like a file, something that can collect
+ * data sent from the c64.
+ * c64 sends:
+ * 0x28 ( listent unit 8 ) and this driver will allocate a new
+ *      iec_io struct for the device 8
+ *
+ * iec_io store the information of a whole communication
+ */
 void iec_newIO(int val)
 {
     int dev;
@@ -425,6 +444,11 @@ void iec_newIO(int val)
     static unsigned char serial = 0;
 
     dev = val & 0x1f;
+    // dev is sent on the BUS, and it's allocate in
+    // iec_open() and it's allocate using the minor of the
+    // device. So, if you open /dev/iec8, you will able to
+    // answer as unit #8, messages to other devices will be
+    // discarded.
     device = iec_openDevices[dev];
     if (!device)
         return;
@@ -457,6 +481,7 @@ void iec_newIO(int val)
     return;
 }
 
+
 void iec_channelIO(int val)
 {
     int chan;
@@ -476,6 +501,7 @@ void iec_channelIO(int val)
     chain->cur->header.channel = val & 0xff;
     return;
 }
+
 
 void iec_appendByte(int val)
 {
@@ -503,7 +529,6 @@ void iec_sendInput(void)
     iec_chain *chain;
     iec_io *io;
 
-
     if (!(device = iec_openDevices[iec_curDevice]))
         return;
 
@@ -524,103 +549,108 @@ void iec_sendInput(void)
 }
   
 
-
 int iec_setupTalker(void)
 {
-  int abort = 0;
+    int abort = 0;
 
-  //printk(KERN_NOTICE "IEC: switching to talk\n");
-  abort = iec_waitForSignals(IEC_ATN, 1, 0, 0, 1000000);  
-  if (!abort && (abort = iec_waitForSignals(IEC_CLK, 1, IEC_ATN, 0, 100000)))
-    printk(KERN_NOTICE "IEC: Timeout waiting for start of talk\n");
+    //printk(KERN_NOTICE "IEC: switching to talk\n");
+    abort = iec_waitForSignals(IEC_ATNIN, 1, 0, 0, 1000000);
+    if (!abort && (abort = iec_waitForSignals(IEC_CLKIN, 1, IEC_ATNIN, 0, 100000)))
+        printk(KERN_NOTICE "IEC: Timeout waiting for start of talk\n");
 
-  if (!abort) {
-    gpio_direction_input(IEC_DATA);
-    gpio_direction_output(IEC_CLK,0);
-    udelay(c64slowdown);
-    iec_state = IECOutputState;
-  }
+    if (!abort) {
+        // TALKED holds CLOCK to true (LOW)
+        // LISTENER hold DATA to true
+        gpio_set_value(IEC_DATAOUT, HIGH);
+        gpio_set_value(IEC_CLKOUT,LOW);
+        udelay(c64slowdown);
+        iec_state = IECOutputState;
+    }
 
-  return abort;
+    return abort;
 }
 
+/*
+ * this function processes the commands, part of them are also
+ * processed elsewhere just to check if the bus must be released
+ */
 static void iec_processData(struct work_struct *work)
 {
-  int avail;
-  int val, atn;
-  int cmd, dev;
+    int avail;
+    int val, atn;
+    int cmd, dev;
 
 
-  for (;;) {
-    avail = (IEC_BUFSIZE + iec_inpos - iec_outpos) % IEC_BUFSIZE;
-    if (!avail)
-      return;
+    for (;;) {
+        avail = (IEC_BUFSIZE + iec_inpos - iec_outpos) % IEC_BUFSIZE;
+        if (!avail)
+            return;
 
-    val = iec_buffer[iec_outpos];
-    atn = val & DATA_ATN;
-    iec_outpos = (iec_outpos + 1) % IEC_BUFSIZE;
-    printk(KERN_NOTICE "IEC: processing data %02x\n", val);
+        val = iec_buffer[iec_outpos];
+        atn = val & DATA_ATN;
+        iec_outpos = ++iec_outpos % IEC_BUFSIZE;
+        printk(KERN_NOTICE "IEC: processing data %02x\n", val);
 
-    if (atn) {
-      cmd = val & 0xe0;
-      dev = val & 0x1f;
+        // if the command has been sent in ATN mode it's something
+        // that addresses the driver
+        if (atn) {
+            cmd = val & 0xe0;
+            dev = val & 0x1f;
 
-      switch (cmd) {
-      case IECListenCommand:
-        if (dev == IEC_ALLDEV || !iec_openDevices[dev])
-          iec_sendInput();
+            switch (cmd) {
+                case IECListenCommand:
+                    if (dev == IEC_BROADCAST || !iec_openDevices[dev])
+                        iec_sendInput();
+                    else {
+                        iec_state = IECListenState;
+                        iec_newIO(val);
+                        iec_curDevice = dev;
+                    }
+                    break;
+
+                case IECTalkCommand:
+                    if (dev == IEC_BROADCAST || !iec_openDevices[dev])
+                        iec_sendInput();
+                    else {
+                        iec_state = IECTalkState;
+                        iec_newIO(val);
+                        iec_curDevice = dev;
+                    }
+                    break;
+
+                case IECChannelCommand:
+                    iec_channelIO(val);
+                    /* Take a break driver 8. We can reach our destination, but we're still a ways away */
+                    if (iec_state == IECTalkState) {
+                        iec_setupTalker();
+                        iec_sendInput();
+                    }
+                    break;
+
+                case IECFileCommand:
+                    iec_channelIO(val);
+                    if (dev == 0x00)
+                        iec_sendInput();
+                    break;
+
+                default:
+                    printk(KERN_NOTICE "IEC: unknown command %02x\n", val);
+                    break;
+            }
+        }
         else {
-          iec_state = IECListenState;
-          iec_newIO(val);
-          iec_curDevice = dev;
+            iec_device *device;
+            iec_appendByte(val);
+            device = iec_openDevices[iec_curDevice];
+            if (val & DATA_EOI)
+                device->in.cur->header.eoi = 1;
+            if (device->in.cur->header.len == sizeof(device->in.cur->data))
+                iec_sendInput();
         }
-        break;
-
-      case IECTalkCommand:
-        if (dev == IEC_ALLDEV || !iec_openDevices[dev])
-          iec_sendInput();
-        else {
-          iec_state = IECTalkState;
-          iec_newIO(val);
-          iec_curDevice = dev;
-        }
-        break;
-
-      case IECChannelCommand:
-        iec_channelIO(val);
-        /* Take a break driver 8. We can reach our destination, but we're still a ways away */
-        if (iec_state == IECTalkState) {
-          iec_setupTalker();
-          iec_sendInput();
-        }
-        break;
-
-      case IECFileCommand:
-        iec_channelIO(val);
-        if (dev == 0x00)
-          iec_sendInput();
-        break;
-
-      default:
-        printk(KERN_NOTICE "IEC: unknown command %02x\n", val);
-        break;
-      }
     }
-    else {
-      iec_device *device;
-
-      
-      iec_appendByte(val);
-      device = iec_openDevices[iec_curDevice];
-      if (val & DATA_EOI)
-        device->in.cur->header.eoi = 1;
-      if (device->in.cur->header.len == sizeof(device->in.cur->data))
-        iec_sendInput();
-    }
-  }
-
-  return;
+    return;
 }
+
 
 int iec_writeByte(int bits)
 {
@@ -670,10 +700,10 @@ int iec_writeByte(int bits)
             abort = 1;
             break;
         }
-        gpio_set_value(IEC_DATAOUT, bits & 1)
-        udelay(c64slowdown*2);
+        gpio_set_value(IEC_DATAOUT, bits & 0X01)
+        udelay(c64slowdown<<1);
         gpio_set_value(IEC_CLKOUT, HIGH);
-        udelay(c64slowdown*2);
+        udelay(c64slowdown<<1);
         
         gpio_set_value(IEC_DATAOUT, HIGH);
         gpio_set_value(IEC_CLKOUT, LOW);
@@ -700,129 +730,139 @@ int iec_writeByte(int bits)
     return abort;
 }
 
+
 int iec_init(void)
 {
-  int result;
-  int minor;
+    int result;
+    int minor;
 
-  /* http://www.makelinux.com/ldd3/ */
-  /* http://stackoverflow.com/questions/5970595/create-a-device-node-in-code */
- 
- 
-  if (!(iec_buffer = kmalloc(IEC_BUFSIZE * sizeof(uint16_t), GFP_KERNEL))) {
-    printk(KERN_NOTICE "IEC: failed to allocate buffer\n");
-    result = -ENOMEM;
-    goto fail_buffer;
-  }
-  iec_inpos = iec_outpos = 0;
+    /* http://www.makelinux.com/ldd3/ */
+    /* http://stackoverflow.com/questions/5970595/create-a-device-node-in-code */
 
-  if ((result = gpio_request(IEC_ATN, LABEL_ATN))) {
-    printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_ATN);
-    goto fail_atn;
-  }
-  if ((result = gpio_request(IEC_CLK, LABEL_CLK))) {
-    printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_CLK);
-    goto fail_clk;
-  }
-  if ((result = gpio_request(IEC_DATA, LABEL_DATA))) {
-    printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_DATA);
-    goto fail_data;
-  }
 
-  gpio_direction_input(IEC_ATN);
-  gpio_direction_input(IEC_CLK);
-  gpio_direction_input(IEC_DATA);
+    if (!(iec_buffer = kmalloc(IEC_BUFSIZE * sizeof(uint16_t), GFP_KERNEL))) {
+        printk(KERN_NOTICE "IEC: failed to allocate buffer\n");
+        result = -ENOMEM;
+        goto fail_buffer;
+    }
+    
+    iec_inpos = iec_outpos = 0;
 
-  /*
-   * Listener holds the DATA LOW ( TRUE )
-   * Talker   holds the CLOCK LOW ( TRUE )
-   * In this case we hold both the line low
-   */ 
-  gpio_direction_output(IEC_CLK, LOW);
-  gpio_direction_output(IEC_DATA, LOW);
- 
+    if ((result = gpio_request(IEC_ATNIN, LABEL_ATNIN))) {
+        printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_ATN);
+        goto fail_atnin;
+    }
+    if ((result = gpio_request(IEC_CLKIN, LABEL_CLKIN))) {
+        printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_CLK);
+        goto fail_clkin;
+    }
+    if ((result = gpio_request(IEC_DATAIN, LABEL_DATAIN))) {
+        printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_DATA);
+        goto fail_datain;
+    }
+    if ((result = gpio_request(IEC_CLKOUT, LABEL_CLKOUT))) {
+        printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_CLK);
+        goto fail_clkout;
+    }
+    if ((result = gpio_request(IEC_DATAOUT, LABEL_DATAOUT))) {
+        printk(KERN_NOTICE "IEC: GPIO request faiure: %s\n", LABEL_DATA);
+        goto fail_dataout;
+    }
 
-  /* 
-   * interrups on ATN and CLK 
-   * this avoids to poll the lines for state change
-   *
-   * When the computer will pull down ATN we will start listeing
-   * WHen clock changes, We can sample the bits.
-   */
-  if ((irq_atn = gpio_to_irq(IEC_ATN)) < 0) {
-    printk(KERN_NOTICE "IEC: GPIO to IRQ mapping faiure %s\n", LABEL_ATN);
-    result = irq_atn;
-    goto fail_mapatn;
-  }
+    printk(KERN_NOTICE "IEC: GPIO SET");
+    gpio_direction_input(IEC_ATNIN);
+    gpio_direction_input(IEC_CLKIN);
+    gpio_direction_input(IEC_DATAIN);
+    gpio_direction_output(IEC_DATAOUT, HIGH)
+    gpio_direction_output(IEC_CLKOUT, HIGH)
+    
+    /*
+    * interrups on ATN and CLK
+    * this avoids to poll the lines for state change
+    *
+    * When the computer will pull down ATN we will start listeing
+    * WHen clock changes, We can sample the bits.
+    */
+    if ((irq_atn = gpio_to_irq(IEC_ATNIN)) < 0) {
+        printk(KERN_NOTICE "IEC: GPIO to IRQ mapping faiure %s\n", LABEL_ATN);
+        result = irq_atn;
+        goto fail_mapatn;
+    }
 
-  if ((irq_clk = gpio_to_irq(IEC_CLK)) < 0) {
-    printk(KERN_NOTICE "IEC: GPIO to IRQ mapping faiure %s\n", LABEL_CLK);
-    result = irq_clk;
-    goto fail_mapclk;
-  }
+    if ((irq_clk = gpio_to_irq(IEC_CLKIN)) < 0) {
+        printk(KERN_NOTICE "IEC: GPIO to IRQ mapping faiure %s\n", LABEL_CLK);
+        result = irq_clk;
+        goto fail_mapclk;
+    }
 
-  /* FIXME - don't enable interrupts until user space opens driver */
-  if ((result = request_irq(irq_atn, (irq_handler_t) iec_handleATN, 
+    /* FIXME - don't enable interrupts until user space opens driver */
+    if ((result = request_irq(irq_atn, (irq_handler_t) iec_handleATN,
                             IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
                             LABEL_ATN, LABEL_DEVICE))) {
-    printk(KERN_NOTICE "IEC: IRQ Request failure\n");
-    goto fail_irqatn;
-  }
+        printk(KERN_NOTICE "IEC: IRQ Request failure\n");
+        goto fail_irqatn;
+    }
 
-  if ((result = request_irq(irq_clk, (irq_handler_t) iec_handleCLK, 
+    if ((result = request_irq(irq_clk, (irq_handler_t) iec_handleCLK,
                             IRQF_TRIGGER_RISING, LABEL_CLK, LABEL_DEVICE))) {
-    printk(KERN_NOTICE "IEC: IRQ Request failure\n");
-    goto fail_irqclk;
-  }
+        printk(KERN_NOTICE "IEC: IRQ Request failure\n");
+        goto fail_irqclk;
+    }
 
-  if ((result = alloc_chrdev_region(&iec_devno, 0, IEC_ALLDEV, LABEL_DEVICE)) < 0) {
-    printk(KERN_NOTICE "IEC: cannot register device\n");
-    goto fail_chrdev;
-  }
+    if ((result = alloc_chrdev_region(&iec_devno, 0, IEC_ALLDEV, LABEL_DEVICE)) < 0) {
+        printk(KERN_NOTICE "IEC: cannot register device\n");
+        goto fail_chrdev;
+    }
 
-  cdev_init(&iec_cdev, &iec_fops);
-  iec_cdev.owner = THIS_MODULE;
-  if ((result = cdev_add(&iec_cdev, iec_devno, IEC_ALLDEV))) {
-    printk(KERN_NOTICE "IEC: failed to add device\n");
-    goto fail_cdevadd;
-  }
+    cdev_init(&iec_cdev, &iec_fops);
+    iec_cdev.owner = THIS_MODULE;
+    if ((result = cdev_add(&iec_cdev, iec_devno, IEC_ALLDEV))) {
+        printk(KERN_NOTICE "IEC: failed to add device\n");
+        goto fail_cdevadd;
+    }
 
-  iec_class = class_create(THIS_MODULE, LABEL_DEVICE);
-  if (IS_ERR(iec_class)) {
-    printk(KERN_NOTICE "IEC: faile to create class\n");
-    goto fail_class;
-  }
+    iec_class = class_create(THIS_MODULE, LABEL_DEVICE);
+    if (IS_ERR(iec_class)) {
+        printk(KERN_NOTICE "IEC: faile to create class\n");
+        goto fail_class;
+    }
 
-  device_create(iec_class, NULL, MKDEV(MAJOR(iec_devno), 0), NULL, "iec%i", 0);
-  for (minor = IEC_FIRSTDEV; minor < IEC_LASTDEV; minor++)
-    device_create(iec_class, NULL, MKDEV(MAJOR(iec_devno), minor), NULL, "iec%i", minor);
-  
-  printk(KERN_NOTICE "IEC module loaded. Major: %i\n", MAJOR(iec_devno));
+    device_create(iec_class, NULL, MKDEV(MAJOR(iec_devno), 0), NULL, "iec%i", 0);
+    for (minor = IEC_FIRSTDEV; minor < IEC_LASTDEV; minor++)
+        device_create(iec_class, NULL, MKDEV(MAJOR(iec_devno), minor), NULL, "iec%i", minor);
 
-  iec_writeQ = create_singlethread_workqueue(LABEL_WRITE);
-  iec_readQ = create_singlethread_workqueue(LABEL_READ);
-  
-  return 0;
+    printk(KERN_NOTICE "IEC module loaded. Major: %i\n", MAJOR(iec_devno));
 
- fail_class:
-  cdev_del(&iec_cdev);
- fail_cdevadd:
-  unregister_chrdev_region(iec_devno, IEC_ALLDEV);
- fail_chrdev:
- fail_irqclk:
-  free_irq(irq_atn, LABEL_DEVICE);
- fail_irqatn:
- fail_mapclk:
- fail_mapatn:
-  gpio_free(IEC_DATA);
- fail_data:
-  gpio_free(IEC_CLK);
- fail_clk:
-  gpio_free(IEC_ATN);
- fail_atn:
-  kfree(iec_buffer);
- fail_buffer:
-  return result;
+    iec_writeQ = create_singlethread_workqueue(LABEL_WRITE);
+    iec_readQ = create_singlethread_workqueue(LABEL_READ);
+
+    return 0;
+
+    fail_class:
+        cdev_del(&iec_cdev);
+    fail_cdevadd:
+        unregister_chrdev_region(iec_devno, IEC_ALLDEV);
+    fail_chrdev:
+    fail_irqclk:
+        free_irq(irq_atn, LABEL_DEVICE);
+    fail_irqatn:
+    fail_mapclk:
+        free_irq(IEC_ATNIN);
+    fail_mapatn:
+    fail_dataout:
+        gpio_free(IEC_DATAOUT);
+    fail_clkout:
+        gpio_free(IEC_CLKOUT);
+    fail_datain:
+        gpio_free(IEC_DATAIN);
+    fail_clkin:
+        gpio_free(IEC_CLKIN);
+    fail_atnin:
+        gpio_free(IEC_ATNIN);
+    fail_buffer:
+        kfree(iec_buffer);
+
+    return result;
 }
 
 void iec_cleanupDevice(int minor)
@@ -853,101 +893,106 @@ void iec_cleanupDevice(int minor)
     
 void iec_cleanup(void)
 {
-  int minor;
+    int minor;
 
-  destroy_workqueue(iec_writeQ);
-  destroy_workqueue(iec_readQ);
-  device_destroy(iec_class, MKDEV(MAJOR(iec_devno), 0));
-  for (minor = IEC_FIRSTDEV; minor < IEC_LASTDEV; minor++) {
-    device_destroy(iec_class, MKDEV(MAJOR(iec_devno), minor));
-    iec_cleanupDevice(minor);
-  }
-  class_destroy(iec_class);
-  cdev_del(&iec_cdev);
-  unregister_chrdev_region(iec_devno, IEC_ALLDEV);
-  kfree(iec_buffer);
+    destroy_workqueue(iec_writeQ);
+    destroy_workqueue(iec_readQ);
+    device_destroy(iec_class, MKDEV(MAJOR(iec_devno), 0));
+    for (minor = IEC_FIRSTDEV; minor < IEC_LASTDEV; minor++) {
+        device_destroy(iec_class, MKDEV(MAJOR(iec_devno), minor));
+        iec_cleanupDevice(minor);
+    }
+    class_destroy(iec_class);
+    cdev_del(&iec_cdev);
+    unregister_chrdev_region(iec_devno, IEC_ALLDEV);
+    kfree(iec_buffer);
 
-  free_irq(irq_atn, LABEL_DEVICE);
-  free_irq(irq_clk, LABEL_DEVICE);
-  gpio_free(IEC_ATN);
-  gpio_free(IEC_CLK);
-  gpio_free(IEC_DATA);
+    free_irq(irq_atn, LABEL_DEVICE);
+    free_irq(irq_clk, LABEL_DEVICE);
+    gpio_free(IEC_ATNIN);
+    gpio_free(IEC_CLKIN);
+    gpio_free(IEC_DATAIN);
+    gpio_free(IEC_CLKOUT);
+    gpio_free(IEC_DATAOUT);
 
-  printk(KERN_NOTICE "IEC module removed\n");
-  return;
+    printk(KERN_NOTICE "IEC module removed\n");
+    return;
 }
 
 /*
  * /dev/iec<minor>
  *
+ * A device can be open by ONE process.
+ *
+ *
  */
 int iec_open(struct inode *inode, struct file *filp)
 {
-  int minor = iminor(inode);
-  iec_device *device;
+    int minor = iminor(inode);
+    iec_device *device;
 
-  printk(KERN_NOTICE "IEC: opening device %i\n", minor);
-  device = iec_openDevices[minor];
+    printk(KERN_NOTICE "IEC: opening device %i\n", minor);
+    device = iec_openDevices[minor];
 
-  /* FIXME - allow more than one process to open at once */
-  if (device) {
-    printk(KERN_NOTICE "IEC: another process already has device %i open\n", minor);
+    /* FIXME - allow more than one process to open at once */
+    if (device) {
+        printk(KERN_NOTICE "IEC: another process already has device %i open\n", minor);
+        return 0;
+    }
+
+    device = iec_openDevices[minor] = kmalloc(sizeof(iec_device), GFP_KERNEL);
+    device->in.head = device->in.tail = device->in.cur = NULL;
+    device->out.outpos = 0;
+    device->flags = filp->f_flags;
+    sema_init(&device->lock, 1);
+    filp->private_data = device;
     return 0;
-  }
-
-  device = iec_openDevices[minor] = kmalloc(sizeof(iec_device), GFP_KERNEL);
-  device->in.head = device->in.tail = device->in.cur = NULL;
-  device->out.outpos = 0;
-  device->flags = filp->f_flags;
-  sema_init(&device->lock, 1);
-  filp->private_data = device;
-  return 0;
 }
 
 int iec_close(struct inode *inode, struct file *filp)
 {
-  int minor = iminor(inode);
-  iec_cleanupDevice(minor);
-  return 0;
+    int minor = iminor(inode);
+    iec_cleanupDevice(minor);
+    return 0;
 }
 
 
 unsigned int iec_poll(struct file *filp, poll_table *wait)
 {
-  int avail = 0;
-  iec_device *device = filp->private_data;
-  iec_io *io;
-  unsigned int pollMask;
+    int avail = 0;
+    iec_device *device = filp->private_data;
+    iec_io *io;
+    unsigned int pollMask;
 
+    io = device->in.head;
+    poll_wait(filp, &iec_canRead, wait);
+    if (io && io != device->in.cur)
+        avail = (io->header.len + sizeof(io->header)) - io->outpos;
 
-  io = device->in.head;
-  poll_wait(filp, &iec_canRead, wait);
-  if (io && io != device->in.cur)
-    avail = (io->header.len + sizeof(io->header)) - io->outpos;
+    //printk(KERN_NOTICE "IEC: polling %i %x %i\n", avail, (size_t) io, io ? io->outpos : -1);
+    pollMask = POLLOUT | POLLWRNORM;
+    
+    if (avail)
+        pollMask |= POLLIN | POLLRDNORM;
 
-  //printk(KERN_NOTICE "IEC: polling %i %x %i\n", avail, (size_t) io, io ? io->outpos : -1);
-  pollMask = POLLOUT | POLLWRNORM;
-  if (avail)
-    pollMask |= POLLIN | POLLRDNORM;
-  
-  return pollMask;
+    return pollMask;
 }
 
 int iec_unlinkIO(iec_device *device)
 {
-  iec_chain *chain;
-  iec_io *io;
+    iec_chain *chain;
+    iec_io *io;
 
 
-  if (down_interruptible(&device->lock))
-    return 0;
+    if (down_interruptible(&device->lock))
+        return 0;
     
-  chain = &device->in;
-  io = chain->head;
-  chain->head = io->next;
-  kfree(io);
-  up(&device->lock);
-  return 1;
+    chain = &device->in;
+    io = chain->head;
+    chain->head = io->next;
+    kfree(io);
+    up(&device->lock);
+    return 1;
 }
     
 /*
@@ -957,155 +1002,147 @@ int iec_unlinkIO(iec_device *device)
  */
 ssize_t iec_read(struct file *filp, char *buf, size_t count, loff_t *f_pos)
 {
-  unsigned long remaining;
-  int avail = 0;
-  iec_device *device = filp->private_data;
-  iec_io *io;
-  unsigned char *wbuf;
+    unsigned long remaining;
+    int avail = 0;
+    iec_device *device = filp->private_data;
+    iec_io *io;
+    unsigned char *wbuf;
 
 
-  do {
-    io = device->in.head;
-    if (io && io != device->in.cur)
-      avail = (io->header.len + sizeof(io->header)) - io->outpos;
-    //printk(KERN_NOTICE "IEC: waiting for data %i\n", avail);
-    if (!avail && wait_event_interruptible(iec_canRead, iec_readAvail))
-      return -ERESTARTSYS;
-    iec_readAvail = 0;
-  } while (!avail);
-  
-  //printk(KERN_NOTICE "IEC: %i bytes avail:", avail);
-  if (down_interruptible(&device->lock)) {
-    printk(KERN_NOTICE "IEC: unable to lock IO\n");
-    return 0;
-  }
+    do {
+        io = device->in.head;
+        if (io && io != device->in.cur)
+            avail = (io->header.len + sizeof(io->header)) - io->outpos;
+        //printk(KERN_NOTICE "IEC: waiting for data %i\n", avail);
+        if (!avail && wait_event_interruptible(iec_canRead, iec_readAvail))
+            return -ERESTARTSYS;
+        iec_readAvail = 0;
+    } while (!avail);
 
-  if (io->outpos < sizeof(io->header)) {
-    wbuf = (unsigned char *) &io->header;
-    wbuf += io->outpos;
-    if (count > sizeof(io->header) - io->outpos)
-      count = sizeof(io->header) - io->outpos;
-  }
-  else {
-    int pos;
+    //printk(KERN_NOTICE "IEC: %i bytes avail:", avail);
+    if (down_interruptible(&device->lock)) {
+        printk(KERN_NOTICE "IEC: unable to lock IO\n");
+        return 0;
+    }
 
-    
-    pos = io->outpos - sizeof(io->header);
-    if (count > io->header.len - pos)
-      count = io->header.len - pos;
-    wbuf = &io->data[pos];
-  }
+    if (io->outpos < sizeof(io->header)) {
+        wbuf = (unsigned char *) &io->header;
+        wbuf += io->outpos;
+        if (count > sizeof(io->header) - io->outpos)
+            count = sizeof(io->header) - io->outpos;
+    }
+    else {
+        int pos;
+        pos = io->outpos - sizeof(io->header);
+        if (count > io->header.len - pos)
+            count = io->header.len - pos;
+        wbuf = &io->data[pos];
+    }
 
-  {
-    int i;
-    for (i = 0; i < count; i++)
-      printk(" %02x", wbuf[i]);
-    printk("\n");
-  }
-  
-  remaining = copy_to_user(buf, wbuf, count);
-  up(&device->lock);
+    {
+        int i;
+        for (i = 0; i < count; i++)
+            printk(" %02x", wbuf[i]);
+        printk("\n");
+    }
 
-  count -= remaining;
-  io->outpos += count;
-  *f_pos += count;
+    remaining = copy_to_user(buf, wbuf, count);
+    up(&device->lock);
 
-  if (io->outpos == io->header.len + sizeof(io->header) &&
-      !iec_unlinkIO(device))
-    return -ERESTARTSYS;
-  
-  return count;
+    count -= remaining;
+    io->outpos += count;
+    *f_pos += count;
+
+    if (io->outpos == io->header.len + sizeof(io->header) &&
+        !iec_unlinkIO(device))
+        return -ERESTARTSYS;
+
+    return count;
 }
+
 
 ssize_t iec_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos)
 {
-  iec_device *device = filp->private_data;
-  iec_io *io;
-  unsigned long remaining;
-  unsigned char *wbuf;
-  size_t len, offset;
-  int abort, val;
-  char data[2];
+    iec_device *device = filp->private_data;
+    iec_io *io;
+    unsigned long remaining;
+    unsigned char *wbuf;
+    size_t len, offset;
+    int abort, val;
+    char data[2];
 
+    printk(KERN_NOTICE "IEC: request to write %i bytes\n", count);
 
-  printk(KERN_NOTICE "IEC: request to write %i bytes\n", count);
-
-  /* FIXME - really only care about EOI unless minor is 0 and acting as master */
-  /* FIXME - how to detect EOI? */
+    /* FIXME - really only care about EOI unless minor is 0 and acting as master */
+    /* FIXME - how to detect EOI? */
   
-  offset = 0;
-  abort = 0;
-  while (!abort && count > 0) {
-    len = count;
-    io = &device->out;
+    offset = 0;
+    abort = 0;
+    while (!abort && count > 0) {
+        len = count;
+        io = &device->out;
 
-    if (io->outpos < sizeof(io->header)) {
-      wbuf = (unsigned char *) &io->header;
-      wbuf += io->outpos;
-      if (len > sizeof(io->header) - io->outpos)
-        len = sizeof(io->header) - io->outpos;
+        if (io->outpos < sizeof(io->header)) {
+            wbuf = (unsigned char *) &io->header;
+            wbuf += io->outpos;
+            if (len > sizeof(io->header) - io->outpos)
+                len = sizeof(io->header) - io->outpos;
 
-      printk(KERN_NOTICE "IEC: write header %i\n", len);
-      remaining = copy_from_user(wbuf, buf+offset, len);
-      len -= remaining;
-      io->outpos += len;
-
-      
-      if (io->outpos == sizeof(io->header)) {
-        int i;
-        unsigned char *p = (unsigned char *) &io->header;
-        printk(KERN_NOTICE "IEC: header");
-        for (i = 0; i < io->outpos; i++)
-          printk(" %02x", p[i]);
-        printk("\n");
-      }
-      
-      if (io->outpos == sizeof(io->header) && !io->header.len) {
-        //printk(KERN_NOTICE "IEC: file not found\n");
-        iec_state = IECWaitState;
-        iec_releaseBus();
-      }
-    }
-    else {
-      if (iec_state != IECOutputState) {
-        len = 0;
-        abort = 1;
-      }
-      else {
-        //printk(KERN_NOTICE "IEC: sending bytes\n");
-        len = 1;
-        remaining = copy_from_user(data, buf+offset, len);
-        len -= remaining;
-        if (len) {
-          val = data[0];
-          if (io->header.eoi && io->outpos + 1 == io->header.len + sizeof(io->header))
-            val |= DATA_EOI;
-#if 1
-          printk(KERN_NOTICE "IEC: sending %02x, %i of %i, %i\n", val,
-                 io->outpos - sizeof(io->header), io->header.len, io->header.eoi);
-#endif
-          abort = iec_writeByte(val);
-          if (abort) {
-            printk(KERN_NOTICE "IEC: write abort %i\n", gpio_get_value(IEC_CLK));
-            len = 0;
-          }
-          else
+            printk(KERN_NOTICE "IEC: write header %i\n", len);
+            remaining = copy_from_user(wbuf, buf+offset, len);
+            len -= remaining;
             io->outpos += len;
+
+            if (io->outpos == sizeof(io->header)) {
+                int i;
+                unsigned char *p = (unsigned char *) &io->header;
+                printk(KERN_NOTICE "IEC: header");
+                for (i = 0; i < io->outpos; i++)
+                    printk(" %02x", p[i]);
+                printk("\n");
+            }
+      
+            if (io->outpos == sizeof(io->header) && !io->header.len) {
+                //printk(KERN_NOTICE "IEC: file not found\n");
+                iec_state = IECWaitState;
+                iec_releaseBus();
+            }
         }
-      }
+        else {
+            if (iec_state != IECOutputState) {
+                len = 0;
+                abort = 1;
+            }
+            else {
+                //printk(KERN_NOTICE "IEC: sending bytes\n");
+                len = 1;
+                remaining = copy_from_user(data, buf+offset, len);
+                len -= remaining;
+                if (len) {
+                    val = data[0];
+                    if (io->header.eoi && io->outpos + 1 == io->header.len + sizeof(io->header))
+                        val |= DATA_EOI;
+#if 1
+                    printk(KERN_NOTICE "IEC: sending %02x, %i of %i, %i\n", val, io->outpos - sizeof(io->header), io->header.len, io->header.eoi);
+#endif
+                    abort = iec_writeByte(val);
+                    if (abort) {
+                        printk(KERN_NOTICE "IEC: write abort %i\n", gpio_get_value(IEC_CLK));
+                        len = 0;
+                    }
+                    else
+                        io->outpos += len;
+                }
+            }
+        }
+        if (abort || io->outpos == io->header.len + sizeof(io->header))
+            io->outpos = 0;
+        count -= len;
+        offset += len;
     }
-
-    if (abort || io->outpos == io->header.len + sizeof(io->header))
-      io->outpos = 0;
-
-    count -= len;
-    offset += len;
-  }
-
-  printk(KERN_NOTICE "IEC: write used %i bytes\n", offset);
-
-  *f_pos += offset;
-  return offset;
+    printk(KERN_NOTICE "IEC: write used %i bytes\n", offset);
+    *f_pos += offset;
+    return offset;
 }
 
 module_init(iec_init);
