@@ -77,22 +77,49 @@
  * GPIO pins
  *
  * it's better to use more gpio in a unidirectional way, it does not need
- * time to switch between input and output mode and make things less noisy
- * on the bus.
+ * time to switch between input and output mode
  * Also, using more than 3 gpio make the code more readable.
+ *
+ *   +-----+-----+---------+------+---+---Pi 3B+-+---+------+---------+-----+-----+
+ *   | BCM | wPi |   Name  | Mode | V | Physical | V | Mode | Name    | wPi | BCM |
+ *   +-----+-----+---------+------+---+----++----+---+------+---------+-----+-----+
+ *   |     |     |    3.3v |      |   |  1 || 2  |   |      | 5v      |     |     |
+ *   |   2 |   8 |   SDA.1 |   IN | 1 |  3 || 4  |   |      | 5v      |     |     |
+ *   |   3 |   9 |   SCL.1 |   IN | 1 |  5 || 6  |   |      | 0v      |     |     |
+ *   |   4 |   7 | GPIO. 7 |   IN | 1 |  7 || 8  | 1 | ALT0 | TxD     | 15  | 14  |
+ *   |     |     |      0v |      |   |  9 || 10 | 1 | ALT0 | RxD     | 16  | 15  |
+ *   |  17 |   0 | GPIO. 0 |   IN | 0 | 11 || 12 | 0 | IN   | GPIO. 1 | 1   | 18  |
+ *   |  27 |   2 | GPIO. 2 |   IN | 0 | 13 || 14 |   |      | 0v      |     |     |
+ *   |  22 |   3 | GPIO. 3 |   IN | 0 | 15 || 16 | 0 | IN   | GPIO. 4 | 4   | 23  |
+ *   |     |     |    3.3v |      |   | 17 || 18 | 0 | IN   | GPIO. 5 | 5   | 24  |
+ *   |  10 |  12 |    MOSI |   IN | 0 | 19 || 20 |   |      | 0v      |     |     |
+ *   |   9 |  13 |    MISO |   IN | 0 | 21 || 22 | 0 | IN   | GPIO. 6 | 6   | 25  |
+ *   |  11 |  14 |    SCLK |   IN | 0 | 23 || 24 | 1 | IN   | CE0     | 10  | 8   |
+ *   |     |     |      0v |      |   | 25 || 26 | 1 | IN   | CE1     | 11  | 7   |
+ *   |   0 |  30 |   SDA.0 |   IN | 1 | 27 || 28 | 1 | IN   | SCL.0   | 31  | 1   |
+ *   |   5 |  21 | GPIO.21 |   IN | 1 | 29 || 30 |   |      | 0v      |     |     |
+ *   |   6 |  22 |*CLKIN** |   IN | 1 | 31 || 32 | 0 | IN   | GPIO.26 | 26  | 12  |
+ *   |  13 |  23 |*DATAIN* |   IN | 0 | 33 || 34 |   |      | 0v      |     |     |
+ *   |  19 |  24 | GPIO.24 |   IN | 1 | 35 || 36 | 0 | IN   | GPIO.27 | 27  | 16  |
+ *   |  26 |  25 |*ATNIN** |   IN | 0 | 37 || 38 | 1 | OUT  |*CLKOUT**| 28  | 20  |
+ *   |     |     |      0v |      |   | 39 || 40 | 1 | OUT  |*DATAOUY*| 29  | 21  |
+ *   +-----+-----+---------+------+---+----++----+---+------+---------+-----+-----+
+ *   | BCM | wPi |   Name  | Mode | V | Physical | V | Mode | Name    | wPi | BCM |
+ *   +-----+-----+---------+------+---+---Pi 3B+-+---+------+---------+-----+-----+
+ *
  */
-// commodore 64 will drive this line all the time
-#define IEC_ATNIN          25
+// commodore 64 will drive the ATN line all the time
+#define IEC_ATNIN         26 
 
-#define IEC_DATAIN        7
-#define IEC_DATAOUT       9
-#define IEC_CLKIN         8
-#define IEC_CLKOUT       10
+#define IEC_DATAIN        13
+#define IEC_DATAOUT       21
+#define IEC_CLKIN          6
+#define IEC_CLKOUT        20
 // new entries.
 // reset allow this device when drop anything
 // IEQ_SQR is used by the C128
-#define IEC_RESETIN       6
-#define IEC_SQR           5
+#define IEC_RESETIN       addme
+#define IEC_SQR           addme
 
 
 #define LABEL_ATNIN       "IEC attention pin (IN)"
@@ -771,13 +798,31 @@ int iec_init(void)
         goto fail_dataout;
     }
 
-    printk(KERN_NOTICE "IEC: GPIO SET");
-    gpio_direction_input(IEC_ATNIN);
-    gpio_direction_input(IEC_CLKIN);
-    gpio_direction_input(IEC_DATAIN);
+    if (gpio_direction_input(IEC_ATNIN)<0) {
+	printk(KERN_NOTICE "Cannot set ATN as INPUT");
+        goto fail_gpio_set;
+    }
+    if (gpio_direction_input(IEC_CLKIN)<0) {
+	printk(KERN_NOTICE "Cannot set CLK as INPUT");
+        goto fail_gpio_set;
+    }
+    if (gpio_direction_input(IEC_DATAIN)<0) {
+	printk(KERN_NOTICE "Cannot set DATA as INPUT");
+        goto fail_gpio_set;
+    }
+    if (gpio_direction_input(IEC_DATAOUT)<0) {
+	printk(KERN_NOTICE "Cannot set DATA as OUTPUT");
+        goto fail_gpio_set;
+    }
+    if (gpio_direction_input(IEC_CLKOUT)<0) {
+	printk(KERN_NOTICE "Cannot set CLK as OUTPUT");
+        goto fail_gpio_set;
+    }
     gpio_direction_output(IEC_DATAOUT, HIGH);
     gpio_direction_output(IEC_CLKOUT, HIGH);
+    printk(KERN_NOTICE "IEC: GPIO SET");
     
+
     /*
     * interrups on ATN and CLK
     * this avoids to poll the lines for state change
@@ -851,6 +896,7 @@ int iec_init(void)
     fail_irqatn:
     fail_mapclk:
     fail_mapatn:
+    fail_gpio_set:
     fail_dataout:
         gpio_free(IEC_DATAOUT);
     fail_clkout:
