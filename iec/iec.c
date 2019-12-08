@@ -250,7 +250,6 @@ static irqreturn_t iec_handleATN(int irq, void *dev_id, struct pt_regs *regs)
     int atn;
     // TRUE = LOW -> 0
     atn = !gpio_get_value(IEC_ATNIN);
-    printk(KERN_NOTICE "IEC: attention %i\n", atn);
     // if the ATN is LOW (TRUE) we have to switch in LISTENER MODE
     if (atn) {
         iec_atnState = IECAttentionState;
@@ -268,7 +267,7 @@ static irqreturn_t iec_handleATN(int irq, void *dev_id, struct pt_regs *regs)
 
 /*
  * This function will read a byte from the bus.
- * and it's strictly time with no interrupts.
+ * and it's strictly timed with no interrupts.
  */
 static inline int iec_readByte(void)
 {
@@ -314,7 +313,6 @@ static inline int iec_readByte(void)
         }
 
         if (elapsed > 100000) {
-          printk(KERN_NOTICE "IEC: Timeout during start\n");
           abort = 1;
           break;
         }
@@ -326,7 +324,6 @@ static inline int iec_readByte(void)
         len = elapsed - c64slowdown;
         if (len > 0 && c64slowdown / 10 < len && len > 5) {
           c64slowdown = elapsed;
-          printk(KERN_NOTICE "IEC: calibrating delay: %i\n", elapsed);
         }
     }
 
@@ -336,7 +333,6 @@ static inline int iec_readByte(void)
     for (len = 0, bits = eoi; !abort && len < 8; len++) {
         // wait CLOCK to go FALSE in 150us  ____-----
         if ((abort = iec_waitForSignals(IEC_CLKIN, 1, 0, 0, 150))) {
-          printk(KERN_NOTICE "IEC: timeout waiting for bit %i\n", len);
           break;
         }
 
@@ -344,7 +340,6 @@ static inline int iec_readByte(void)
             bits |= 1 << len;
         // wait CLOCK to go TRUE in 150us -----_____
         if (iec_waitForSignals(IEC_CLKIN, 0, 0, 0, 150)) {
-              printk(KERN_NOTICE "IEC: Timeout after bit %i\n", len);
               if (len < 7)
                   abort = 1;
         }
@@ -383,7 +378,6 @@ static irqreturn_t iec_handleCLK(int irq, void *dev_id, struct pt_regs *regs)
     if (!atn)
         iec_atnState = IECWaitState;
 
-    printk(KERN_NOTICE "IEC: clock %i/%i %i\n", iec_atnState, atn, iec_state);
     if (
         iec_atnState != IECAttentionState &&
         (   iec_state == IECWaitState
@@ -688,7 +682,6 @@ int iec_writeByte(int bits)
     unsigned long flags;
 
     if (!gpio_get_value(IEC_ATNIN) || iec_state != IECOutputState) {
-        printk(KERN_NOTICE "IEC: attention before write\n");
         return 1;
     }
 
@@ -700,23 +693,18 @@ int iec_writeByte(int bits)
     //printk(KERN_NOTICE "IEC: Write: %03x data: %i\n", bits, gpio_get_value(IEC_DATA));
     gpio_set_value(IEC_CLKOUT, HIGH);
 
-    if ((abort = iec_waitForSignals(IEC_DATAIN, 1, IEC_ATNIN, 0, 100000)))
-        printk(KERN_NOTICE "IEC: Timeout waiting to send\n");
+    abort = iec_waitForSignals(IEC_DATAIN, 1, IEC_ATNIN, 0, 100000)
 
     /* Because interrupts are disabled it's possible to miss the ATN pause signal */
     if (!gpio_get_value(IEC_ATNIN)) {
-        printk(KERN_NOTICE "IEC: attention before send\n");
         iec_state = IECWaitState;
         iec_atnState = IECAttentionState;
         abort = 1;
     }
 
     if (!abort && (bits & DATA_EOI)) {
-        if ((abort = iec_waitForSignals(IEC_DATAIN, 0, IEC_ATNIN, 0, 100000)))
-          printk(KERN_NOTICE "IEC: Timeout waiting for EOI ack\n");
-
-        if (!abort && (abort = iec_waitForSignals(IEC_DATAIN, 1, IEC_ATNIN, 0, 100000)))
-          printk(KERN_NOTICE "IEC: Timeout waiting for EOI ack finish\n");
+        abort = iec_waitForSignals(IEC_DATAIN, 0, IEC_ATNIN, 0, 100000)
+        abort = iec_waitForSignals(IEC_DATAIN, 1, IEC_ATNIN, 0, 100000)
     }
 
     gpio_set_value(IEC_CLKOUT,LOW);
@@ -725,7 +713,6 @@ int iec_writeByte(int bits)
 
     for (len = 0; !abort && len < 8; len++, bits >>= 1) {
         if (!gpio_get_value(IEC_ATNIN) || iec_state != IECOutputState) {
-            printk(KERN_NOTICE "IEC: attention during write\n");
             abort = 1;
             break;
         }
@@ -741,11 +728,9 @@ int iec_writeByte(int bits)
 
     if (!abort && (abort = iec_waitForSignals(IEC_DATAIN, 0, IEC_ATNIN, 0, 10000))) {
         if (gpio_get_value(IEC_ATNIN)) {
-            printk(KERN_NOTICE "IEC: Timeout waiting for listener ack\n");
             abort = 0;
         }
         else {
-            printk(KERN_NOTICE "IEC: attention after write\n");
             iec_state = IECWaitState;
             iec_atnState = IECAttentionState;
         }

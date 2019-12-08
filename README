@@ -66,6 +66,10 @@ GPIO.29 is pin 21
 GPIO.22 is pin 6
 GPIO.28 is pin 20
 
+Cable.
+
+The cable is the same used in the pi1541 project, of course the pins are not the same.
+I added the image taken from the pi1541 website and also a schema of a GPIO equivalent schema.
 
 
 httpr//insentricity.com/a.cl/207
